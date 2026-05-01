@@ -1,10 +1,8 @@
 import { z } from "zod";
 import { db } from "./db";
+import type { User } from "./types";
 
-export interface User {
-  id: string;
-  name: string;
-}
+export type { User };
 
 const nameSchema = z.string().trim().min(1).max(120);
 

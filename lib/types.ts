@@ -1,3 +1,8 @@
+export interface User {
+  id: string;
+  name: string;
+}
+
 export type JobStatus = "pending" | "running" | "completed" | "failed";
 
 export type TaskKind = "cpu" | "ssh" | "training";
