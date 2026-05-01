@@ -85,7 +85,7 @@ export async function createJob(input: CreateJobInput): Promise<CreateJobResult>
     );
     const jobId = jobIns.rows[0].id;
 
-    // SPEC §3.2: insert all N CPU tasks as 'pending' at job-creation time.
+    // Insert all N CPU tasks as 'pending' at job-creation time.
     // The scheduler — not the API — decides when they enter Redis.
     await tx.query(
       `INSERT INTO tasks (job_id, user_id, kind, status)

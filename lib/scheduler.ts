@@ -15,16 +15,16 @@ export interface SchedulerQueues {
   cpu: DispatchQueue;
 }
 
-// Picks the next pending CPU task using SPEC §3.3 fairness ordering, creates
-// a lease, and flips the task to 'queued' — all in one transaction. Returns
-// null when no eligible task remains. Caller enqueues to BullMQ outside the
-// transaction (SPEC §10: "Never hold a DB transaction open across a BullMQ
-// enqueue").
+// Picks the next pending CPU task using fairness ordering (least active CPU
+// leases per user, then oldest job, then oldest task), creates a lease, and
+// flips the task to 'queued' — all in one transaction. Returns null when no
+// eligible task remains. Caller enqueues to BullMQ outside the transaction:
+// never hold a DB transaction open across a BullMQ enqueue.
 async function reserveOneCpuTask(
   leaseTtlMs: number,
 ): Promise<DispatchMessage | null> {
   return db.tx(async (tx) => {
-    // SPEC §3.3 ordering. The correlated subquery counts active CPU leases per
+    // Fairness ordering. The correlated subquery counts active CPU leases per
     // candidate user, evaluated for each row before SKIP LOCKED applies.
     const pick = await tx.query<{
       task_id: string;
