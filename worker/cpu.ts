@@ -1,6 +1,7 @@
 import { access } from "node:fs/promises";
 import { getConfig } from "../lib/config";
 import { cpuArtifactPath, writeArtifactFile } from "../lib/artifacts";
+import { sleep } from "../lib/sleep";
 import {
   claimTask,
   finalizeCpuSuccess,
@@ -10,10 +11,6 @@ import {
 
 function randomBetween(minMs: number, maxMs: number): number {
   return Math.floor(minMs + Math.random() * (maxMs - minMs + 1));
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 export type CpuWorkFn = (taskId: string) => Promise<string>;
