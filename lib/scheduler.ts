@@ -56,7 +56,9 @@ async function reserveOneCpuTask(
       [row.task_id, row.user_id, leaseTtlMs],
     );
 
-    await tx.query(`UPDATE tasks SET status='queued' WHERE id=$1`, [row.task_id]);
+    await tx.query(`UPDATE tasks SET status='queued' WHERE id=$1`, [
+      row.task_id,
+    ]);
 
     return {
       taskId: row.task_id,
