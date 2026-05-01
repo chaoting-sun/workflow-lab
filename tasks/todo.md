@@ -11,7 +11,7 @@ Tick a box only when **acceptance criteria + verification steps** for that task 
 
 - [x] **T1** — Project scaffold (Next.js + TS strict + Tailwind + pnpm + docker-compose + zod env config) — M
 - [x] **T2** — DB schema (`db/schema.sql`, all tables/indexes/unique constraints from SPEC §3.4) — S
-- [ ] **T3** — DB client + advisory-lock helper (`lib/db.ts`, `lib/advisory-lock.ts`) — S
+- [x] **T3** — DB client + advisory-lock helper (`lib/db.ts`, `lib/advisory-lock.ts`) — S
 
 ### ✅ Checkpoint A — Foundation
 - [ ] `pnpm dev` + `docker compose up -d` + `pnpm db:reset` work on a fresh clone
