@@ -27,7 +27,7 @@ Tick a box only when **acceptance criteria + verification steps** for that task 
 - [x] **T6** — CPU worker with atomic-claim + optimistic-lock — M
 - [x] **T7** — SSH worker + barrier check (counts `artifacts` table) — M
 - [x] **T8** — Training worker + job completion — S
-- [ ] **T9** — Minimal dashboard (form + job list with progress) — M
+- [x] **T9** — Minimal dashboard (form + job list with progress) — M
 
 ### ✅ Checkpoint B — Happy path
 - [ ] SPEC §9.1 happy path: 1 user, `PIPELINES_PER_JOB=200`, all chaos = 0 → job completes
