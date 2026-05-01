@@ -63,6 +63,36 @@ export async function makeQueuedCpuTaskWithLease(
   };
 }
 
+// Forge a queued training task + active training lease under a fresh job.
+// Bypasses the barrier / SSH stages — used by training-worker tests that
+// only care about the claim/finalize transition.
+export async function makeQueuedTrainingTaskWithLease(
+  userId: string,
+): Promise<QueuedTaskFixture> {
+  const job = await createJob({ userId, pipelinesCount: 1 });
+  const ins = await db.query<{ id: string; attempts: number }>(
+    `INSERT INTO tasks (job_id, user_id, kind, status)
+       VALUES ($1, $2, 'training', 'queued')
+       RETURNING id, attempts`,
+    [job.jobId, userId],
+  );
+  const taskId = ins.rows[0].id;
+  const attempts = ins.rows[0].attempts;
+  const lease = await db.query<{ id: string }>(
+    `INSERT INTO leases (task_id, user_id, resource, expires_at)
+       VALUES ($1, $2, 'training', now() + interval '1 minute')
+       RETURNING id`,
+    [taskId, userId],
+  );
+  return {
+    jobId: job.jobId,
+    taskId,
+    leaseId: lease.rows[0].id,
+    attempts,
+    userId,
+  };
+}
+
 // Forge a queued SSH task + active SSH lease under a fresh job. The job has
 // `pipelinesCount` CPU pending tasks (untouched), one of which is reused as
 // the SSH parent. Use pipelinesCount=1 to exercise the barrier-fires path

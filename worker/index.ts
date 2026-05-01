@@ -11,11 +11,13 @@ import {
   cpuDispatchQueue,
   getRedisConnection,
   sshDispatchQueue,
+  trainingDispatchQueue,
 } from "../lib/queues";
 import { runSchedulerLoop } from "../lib/scheduler";
 import type { WorkerTaskMessage } from "../lib/worker";
 import { runCpuTask } from "./cpu";
 import { runSshTask } from "./ssh";
+import { runTrainingTask } from "./training";
 
 async function main(): Promise<void> {
   const cfg = getConfig();
@@ -57,8 +59,26 @@ async function main(): Promise<void> {
     console.error(`ssh job ${job?.id} failed:`, err);
   });
 
+  const trainingWorker = new Worker<WorkerTaskMessage>(
+    "training",
+    async (job: Job<WorkerTaskMessage>) => {
+      await runTrainingTask(job.data);
+    },
+    {
+      connection: getRedisConnection(),
+      lockDuration: cfg.BULLMQ_LOCK_DURATION_MS,
+    },
+  );
+  trainingWorker.on("failed", (job, err) => {
+    console.error(`training job ${job?.id} failed:`, err);
+  });
+
   const loop = runSchedulerLoop({
-    queues: { cpu: cpuDispatchQueue, ssh: sshDispatchQueue },
+    queues: {
+      cpu: cpuDispatchQueue,
+      ssh: sshDispatchQueue,
+      training: trainingDispatchQueue,
+    },
     intervalMs: cfg.SCHEDULER_TICK_MS,
   });
   console.log(`scheduler tick loop started (interval=${cfg.SCHEDULER_TICK_MS}ms)`);
@@ -72,6 +92,7 @@ async function main(): Promise<void> {
       await loop.stop();
       await cpuWorker.close();
       await sshWorker.close();
+      await trainingWorker.close();
       await closeQueues();
       await lock.release();
       await closeDb();

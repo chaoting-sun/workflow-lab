@@ -14,12 +14,14 @@ export interface DispatchQueue {
 export interface SchedulerQueues {
   cpu: DispatchQueue;
   ssh?: DispatchQueue;
+  training?: DispatchQueue;
 }
 
+type DispatchKind = "cpu" | "ssh" | "training";
+
 // `kind` doubles as the leases.resource value: every CPU lease tracks CPU
-// slot usage, every SSH lease tracks SSH slot usage. Each kind has its own
-// independent slot pool. Training is dispatched separately once that worker
-// lands and is not part of this helper's domain.
+// slot usage, every SSH lease tracks SSH slot usage, every training lease
+// tracks training slot usage. Each kind has its own independent slot pool.
 
 // Picks the next pending task of `kind` using fairness ordering (least active
 // leases of the same resource per user, then oldest job, then oldest task),
@@ -27,7 +29,7 @@ export interface SchedulerQueues {
 // Caller enqueues to BullMQ outside the transaction: never hold a DB
 // transaction open across a BullMQ enqueue.
 async function reserveOneTask(
-  kind: "cpu" | "ssh",
+  kind: DispatchKind,
   leaseTtlMs: number,
 ): Promise<DispatchMessage | null> {
   return db.tx(async (tx) => {
@@ -77,7 +79,7 @@ async function reserveOneTask(
   });
 }
 
-async function countActiveLeases(resource: "cpu" | "ssh"): Promise<number> {
+async function countActiveLeases(resource: DispatchKind): Promise<number> {
   const { rows } = await db.query<{ count: string }>(
     `SELECT count(*)::text AS count
        FROM leases
@@ -94,7 +96,7 @@ async function countActiveLeases(resource: "cpu" | "ssh"): Promise<number> {
 // broken queue.
 async function dispatchKind(
   queue: DispatchQueue,
-  kind: "cpu" | "ssh",
+  kind: DispatchKind,
   slotsCap: number,
 ): Promise<number> {
   const cfg = getConfig();
@@ -119,6 +121,10 @@ export async function dispatchCpu(queue: DispatchQueue): Promise<number> {
 
 export async function dispatchSsh(queue: DispatchQueue): Promise<number> {
   return dispatchKind(queue, "ssh", getConfig().GLOBAL_SSH_SLOTS);
+}
+
+export async function dispatchTraining(queue: DispatchQueue): Promise<number> {
+  return dispatchKind(queue, "training", getConfig().GLOBAL_TRAINING_SLOTS);
 }
 
 export interface SchedulerLoopOptions {
@@ -148,14 +154,16 @@ export function runSchedulerLoop(
     timer = setTimeout(loop, opts.intervalMs);
   };
 
-  // CPU and SSH dispatch touch disjoint leases.resource values and disjoint
-  // tasks.kind rows, so they share no row-level locks and can run in parallel
-  // within a single scheduler instance.
+  // CPU, SSH and training dispatch touch disjoint leases.resource values and
+  // disjoint tasks.kind rows, so they share no row-level locks and can run in
+  // parallel within a single scheduler instance.
   const loop = (): void => {
     inFlight = (async () => {
       try {
         const work: Promise<unknown>[] = [dispatchCpu(opts.queues.cpu)];
         if (opts.queues.ssh) work.push(dispatchSsh(opts.queues.ssh));
+        if (opts.queues.training)
+          work.push(dispatchTraining(opts.queues.training));
         await Promise.all(work);
       } catch (err) {
         onError(err);

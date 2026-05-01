@@ -97,6 +97,37 @@ export async function finalizeCpuSuccess(
   });
 }
 
+// Job-completion is the only side effect outside the task/lease pair: the
+// `status NOT IN ('completed','failed')` guard makes it idempotent across
+// re-deliveries and prevents a successful retry from clobbering a job that
+// was already permanently failed.
+export async function finalizeTrainingSuccess(
+  claimed: ClaimedTask,
+  leaseId: string,
+): Promise<void> {
+  await db.tx(async (tx) => {
+    const upd = await tx.query(
+      `UPDATE tasks
+          SET status='succeeded', finished_at=now()
+        WHERE id=$1 AND attempts=$2 AND status='running'
+        RETURNING id`,
+      [claimed.taskId, claimed.myAttempts],
+    );
+    if (upd.rowCount === 0) throw new StaleAttemptError();
+
+    await tx.query(`UPDATE leases SET released_at=now() WHERE id=$1`, [
+      leaseId,
+    ]);
+
+    await tx.query(
+      `UPDATE jobs
+          SET status='completed', completed_at=now()
+        WHERE id=$1 AND status NOT IN ('completed','failed')`,
+      [claimed.jobId],
+    );
+  });
+}
+
 // The barrier check may insert a single training task once every SSH artifact
 // for the job is present; see lib/barrier.ts for serialisation guarantees.
 export async function finalizeSshSuccess(

@@ -6,6 +6,7 @@ import { createJob } from "./jobs";
 import {
   dispatchCpu,
   dispatchSsh,
+  dispatchTraining,
   type DispatchMessage,
   type DispatchQueue,
 } from "./scheduler";
@@ -282,5 +283,63 @@ describe("dispatchSsh", () => {
     const queue = new FakeQueue();
     const n = await dispatchSsh(queue);
     expect(n).toBe(2);
+  });
+});
+
+// Forge a pending training task (one per job) without running CPU/SSH stages.
+async function makePendingTrainingTask(userId: string): Promise<string> {
+  const job = await createJob({ userId, pipelinesCount: 1 });
+  await db.query(
+    `INSERT INTO tasks (job_id, user_id, kind, status)
+       VALUES ($1, $2, 'training', 'pending')`,
+    [job.jobId, userId],
+  );
+  return job.jobId;
+}
+
+describe("dispatchTraining", () => {
+  it("returns 0 and enqueues nothing when no training tasks are pending", async () => {
+    const queue = new FakeQueue();
+    expect(await dispatchTraining(queue)).toBe(0);
+    expect(queue.messages).toEqual([]);
+  });
+
+  it("dispatches pending training tasks, marks them queued, creates training-resource leases", async () => {
+    const u = await createUser(`${PREFIX}-train-u`);
+    const jobA = await makePendingTrainingTask(u.id);
+    const jobB = await makePendingTrainingTask(u.id);
+
+    const queue = new FakeQueue();
+    const n = await dispatchTraining(queue);
+    expect(n).toBe(2);
+    expect(queue.messages).toHaveLength(2);
+
+    const queuedRows = await db.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM tasks
+         WHERE job_id = ANY($1::uuid[]) AND kind='training' AND status='queued'`,
+      [[jobA, jobB]],
+    );
+    expect(queuedRows.rows[0].count).toBe("2");
+
+    for (const m of queue.messages) {
+      const lease = await db.query<{ count: string }>(
+        `SELECT count(*)::text AS count FROM leases
+           WHERE task_id=$1 AND resource='training' AND released_at IS NULL`,
+        [m.taskId],
+      );
+      expect(lease.rows[0].count).toBe("1");
+    }
+  });
+
+  it("uses TRAINING-resource leases when computing free slots, not CPU leases", async () => {
+    const filler = await createUser(`${PREFIX}-train-cpu-filler`);
+    await fillActiveCpuLeases(filler.id, 20);
+
+    const u = await createUser(`${PREFIX}-train-u2`);
+    await makePendingTrainingTask(u.id);
+
+    const queue = new FakeQueue();
+    const n = await dispatchTraining(queue);
+    expect(n).toBe(1);
   });
 });
