@@ -22,7 +22,7 @@ Tick a box only when **acceptance criteria + verification steps** for that task 
 
 ## Phase 2: Happy-path vertical slice
 
-- [ ] **T4** — Users & jobs API (POST/GET, zod validation, `pipelines_count` snapshot) — M
+- [x] **T4** — Users & jobs API (POST/GET, zod validation, `pipelines_count` snapshot) — M
 - [ ] **T5** — Scheduler tick (CPU only) with single-instance advisory lock — M
 - [ ] **T6** — CPU worker with atomic-claim + optimistic-lock — M
 - [ ] **T7** — SSH worker + barrier check (counts `artifacts` table) — M
