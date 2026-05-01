@@ -10,7 +10,7 @@ Tick a box only when **acceptance criteria + verification steps** for that task 
 ## Phase 1: Foundation
 
 - [x] **T1** — Project scaffold (Next.js + TS strict + Tailwind + pnpm + docker-compose + zod env config) — M
-- [ ] **T2** — DB schema (`db/schema.sql`, all tables/indexes/unique constraints from SPEC §3.4) — S
+- [x] **T2** — DB schema (`db/schema.sql`, all tables/indexes/unique constraints from SPEC §3.4) — S
 - [ ] **T3** — DB client + advisory-lock helper (`lib/db.ts`, `lib/advisory-lock.ts`) — S
 
 ### ✅ Checkpoint A — Foundation
