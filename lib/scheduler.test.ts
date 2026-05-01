@@ -5,6 +5,7 @@ import { createUser } from "./users";
 import { createJob } from "./jobs";
 import {
   dispatchCpu,
+  dispatchSsh,
   type DispatchMessage,
   type DispatchQueue,
 } from "./scheduler";
@@ -212,5 +213,74 @@ describe("dispatchCpu", () => {
     expect(queue.messages).toHaveLength(3);
     const ids = new Set(queue.messages.map((m) => m.taskId));
     expect(ids.size).toBe(3);
+  });
+});
+
+// Forge `count` pending SSH tasks under one user (sharing a job) without
+// running the CPU stage. Returns the job id.
+async function makePendingSshTasks(
+  userId: string,
+  count: number,
+): Promise<string> {
+  const job = await createJob({ userId, pipelinesCount: count });
+  const cpus = await db.query<{ id: string }>(
+    `SELECT id FROM tasks WHERE job_id=$1 AND kind='cpu' ORDER BY created_at`,
+    [job.jobId],
+  );
+  for (const c of cpus.rows) {
+    await db.query(
+      `INSERT INTO tasks (job_id, user_id, kind, status, parent_task_id)
+         VALUES ($1, $2, 'ssh', 'pending', $3)`,
+      [job.jobId, userId, c.id],
+    );
+  }
+  return job.jobId;
+}
+
+describe("dispatchSsh", () => {
+  it("returns 0 and enqueues nothing when no SSH tasks are pending", async () => {
+    const queue = new FakeQueue();
+    expect(await dispatchSsh(queue)).toBe(0);
+    expect(queue.messages).toEqual([]);
+  });
+
+  it("dispatches all pending SSH tasks under the GLOBAL_SSH_SLOTS cap, marks them queued, creates SSH leases", async () => {
+    const u = await createUser(`${PREFIX}-ssh-u`);
+    const jobId = await makePendingSshTasks(u.id, 3);
+
+    const queue = new FakeQueue();
+    const n = await dispatchSsh(queue);
+    expect(n).toBe(3);
+    expect(queue.messages).toHaveLength(3);
+
+    const queuedSsh = await db.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM tasks
+         WHERE job_id=$1 AND kind='ssh' AND status='queued'`,
+      [jobId],
+    );
+    expect(queuedSsh.rows[0].count).toBe("3");
+
+    for (const m of queue.messages) {
+      const lease = await db.query<{ count: string }>(
+        `SELECT count(*)::text AS count FROM leases
+           WHERE task_id=$1 AND resource='ssh' AND released_at IS NULL`,
+        [m.taskId],
+      );
+      expect(lease.rows[0].count).toBe("1");
+    }
+  });
+
+  it("uses SSH-resource leases when computing free slots, not CPU leases", async () => {
+    // Saturate CPU resource pool: with 20 CPU leases active, dispatchCpu would
+    // refuse, but dispatchSsh must be unaffected.
+    const filler = await createUser(`${PREFIX}-ssh-cpu-filler`);
+    await fillActiveCpuLeases(filler.id, 20);
+
+    const u = await createUser(`${PREFIX}-ssh-u2`);
+    await makePendingSshTasks(u.id, 2);
+
+    const queue = new FakeQueue();
+    const n = await dispatchSsh(queue);
+    expect(n).toBe(2);
   });
 });

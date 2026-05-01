@@ -62,3 +62,39 @@ export async function makeQueuedCpuTaskWithLease(
     userId,
   };
 }
+
+// Forge a queued SSH task + active SSH lease under a fresh job. The job has
+// `pipelinesCount` CPU pending tasks (untouched), one of which is reused as
+// the SSH parent. Use pipelinesCount=1 to exercise the barrier-fires path
+// after this SSH succeeds; pipelinesCount>1 to exercise the partial path.
+export async function makeQueuedSshTaskWithLease(
+  userId: string,
+  pipelinesCount = 1,
+): Promise<QueuedTaskFixture> {
+  const job = await createJob({ userId, pipelinesCount });
+  const parent = await db.query<{ id: string }>(
+    `SELECT id FROM tasks WHERE job_id=$1 AND kind='cpu' ORDER BY created_at LIMIT 1`,
+    [job.jobId],
+  );
+  const ins = await db.query<{ id: string; attempts: number }>(
+    `INSERT INTO tasks (job_id, user_id, kind, status, parent_task_id)
+       VALUES ($1, $2, 'ssh', 'queued', $3)
+       RETURNING id, attempts`,
+    [job.jobId, userId, parent.rows[0].id],
+  );
+  const taskId = ins.rows[0].id;
+  const attempts = ins.rows[0].attempts;
+  const lease = await db.query<{ id: string }>(
+    `INSERT INTO leases (task_id, user_id, resource, expires_at)
+       VALUES ($1, $2, 'ssh', now() + interval '1 minute')
+       RETURNING id`,
+    [taskId, userId],
+  );
+  return {
+    jobId: job.jobId,
+    taskId,
+    leaseId: lease.rows[0].id,
+    attempts,
+    userId,
+  };
+}

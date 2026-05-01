@@ -10,10 +10,12 @@ import {
   closeQueues,
   cpuDispatchQueue,
   getRedisConnection,
+  sshDispatchQueue,
 } from "../lib/queues";
 import { runSchedulerLoop } from "../lib/scheduler";
 import type { WorkerTaskMessage } from "../lib/worker";
 import { runCpuTask } from "./cpu";
+import { runSshTask } from "./ssh";
 
 async function main(): Promise<void> {
   const cfg = getConfig();
@@ -41,8 +43,22 @@ async function main(): Promise<void> {
     console.error(`cpu job ${job?.id} failed:`, err);
   });
 
+  const sshWorker = new Worker<WorkerTaskMessage>(
+    "ssh",
+    async (job: Job<WorkerTaskMessage>) => {
+      await runSshTask(job.data);
+    },
+    {
+      connection: getRedisConnection(),
+      lockDuration: cfg.BULLMQ_LOCK_DURATION_MS,
+    },
+  );
+  sshWorker.on("failed", (job, err) => {
+    console.error(`ssh job ${job?.id} failed:`, err);
+  });
+
   const loop = runSchedulerLoop({
-    queues: { cpu: cpuDispatchQueue },
+    queues: { cpu: cpuDispatchQueue, ssh: sshDispatchQueue },
     intervalMs: cfg.SCHEDULER_TICK_MS,
   });
   console.log(`scheduler tick loop started (interval=${cfg.SCHEDULER_TICK_MS}ms)`);
@@ -55,6 +71,7 @@ async function main(): Promise<void> {
     try {
       await loop.stop();
       await cpuWorker.close();
+      await sshWorker.close();
       await closeQueues();
       await lock.release();
       await closeDb();

@@ -1,5 +1,6 @@
 import { db } from "./db";
 import { getConfig } from "./config";
+import { runBarrierCheck } from "./barrier";
 
 export interface WorkerTaskMessage {
   taskId: string;
@@ -93,5 +94,37 @@ export async function finalizeCpuSuccess(
          ON CONFLICT (parent_task_id) WHERE kind = 'ssh' DO NOTHING`,
       [claimed.jobId, claimed.userId, claimed.taskId, getConfig().MAX_ATTEMPTS],
     );
+  });
+}
+
+// The barrier check may insert a single training task once every SSH artifact
+// for the job is present; see lib/barrier.ts for serialisation guarantees.
+export async function finalizeSshSuccess(
+  claimed: ClaimedTask,
+  leaseId: string,
+  artifactPath: string,
+): Promise<void> {
+  await db.tx(async (tx) => {
+    const upd = await tx.query(
+      `UPDATE tasks
+          SET status='succeeded', finished_at=now()
+        WHERE id=$1 AND attempts=$2 AND status='running'
+        RETURNING id`,
+      [claimed.taskId, claimed.myAttempts],
+    );
+    if (upd.rowCount === 0) throw new StaleAttemptError();
+
+    await tx.query(
+      `INSERT INTO artifacts (task_id, path)
+         VALUES ($1, $2)
+         ON CONFLICT (task_id) DO NOTHING`,
+      [claimed.taskId, artifactPath],
+    );
+
+    await tx.query(`UPDATE leases SET released_at=now() WHERE id=$1`, [
+      leaseId,
+    ]);
+
+    await runBarrierCheck(tx, claimed.jobId);
   });
 }
