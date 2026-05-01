@@ -24,7 +24,7 @@ Tick a box only when **acceptance criteria + verification steps** for that task 
 
 - [x] **T4** — Users & jobs API (POST/GET, zod validation, `pipelines_count` snapshot) — M
 - [x] **T5** — Scheduler tick (CPU only) with single-instance advisory lock — M
-- [ ] **T6** — CPU worker with atomic-claim + optimistic-lock — M
+- [x] **T6** — CPU worker with atomic-claim + optimistic-lock — M
 - [ ] **T7** — SSH worker + barrier check (counts `artifacts` table) — M
 - [ ] **T8** — Training worker + job completion — S
 - [ ] **T9** — Minimal dashboard (form + job list with progress) — M

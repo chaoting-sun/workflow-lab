@@ -1,11 +1,8 @@
-// Worker process entrypoint.
-// Run with: pnpm worker
-//
-// Boots one scheduler tick loop guarded by the Postgres advisory lock plus an
-// empty BullMQ Worker shell for the cpu queue. Real handlers (cpu/ssh/training)
-// land in T6/T7/T8.
+// Worker process entrypoint. Run with: pnpm worker.
+// Boots the scheduler tick loop (guarded by the Postgres advisory lock) and
+// the BullMQ Workers in a single Node process.
 
-import { Worker } from "bullmq";
+import { Worker, type Job } from "bullmq";
 import { acquireSchedulerLock } from "../lib/advisory-lock";
 import { getConfig } from "../lib/config";
 import { closeDb } from "../lib/db";
@@ -15,6 +12,8 @@ import {
   getRedisConnection,
 } from "../lib/queues";
 import { runSchedulerLoop } from "../lib/scheduler";
+import type { WorkerTaskMessage } from "../lib/worker";
+import { runCpuTask } from "./cpu";
 
 async function main(): Promise<void> {
   const cfg = getConfig();
@@ -28,17 +27,19 @@ async function main(): Promise<void> {
   }
   console.log("scheduler lock acquired");
 
-  // Empty CPU worker shell. Real handler lands in T6.
-  const cpuWorker = new Worker(
+  const cpuWorker = new Worker<WorkerTaskMessage>(
     "cpu",
-    async () => {
-      // no-op until T6
+    async (job: Job<WorkerTaskMessage>) => {
+      await runCpuTask(job.data);
     },
     {
       connection: getRedisConnection(),
       lockDuration: cfg.BULLMQ_LOCK_DURATION_MS,
     },
   );
+  cpuWorker.on("failed", (job, err) => {
+    console.error(`cpu job ${job?.id} failed:`, err);
+  });
 
   const loop = runSchedulerLoop({
     queues: { cpu: cpuDispatchQueue },
