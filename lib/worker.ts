@@ -22,10 +22,14 @@ export class StaleAttemptError extends Error {
   }
 }
 
-// Atomic claim: flips queued→running and bumps attempts in one statement.
-// The compound WHERE rejects stale BullMQ deliveries — status moved on,
-// attempts moved on, or the lease was released. A null return is the
-// caller's signal to silently abort.
+// Atomic claim: the compound WHERE on tasks rejects stale BullMQ deliveries
+// (status moved on, attempts moved on, or the lease was released); a null
+// return is the caller's signal to silently abort. The job-status promotion
+// is gated on `status='pending'` for idempotency across re-claims and so it
+// never overwrites a terminal 'completed'/'failed' state — and on
+// `id IN (SELECT job_id FROM claimed)` so a rejected claim leaves jobs
+// untouched. Both UPDATEs run in one CTE statement, so claim + promotion
+// commit (or roll back) together with a single round-trip.
 export async function claimTask(
   msg: WorkerTaskMessage,
 ): Promise<ClaimedTask | null> {
@@ -34,16 +38,22 @@ export async function claimTask(
     job_id: string;
     user_id: string;
   }>(
-    `UPDATE tasks
-        SET status='running', started_at=now(), attempts=attempts+1
-      WHERE id = $1
-        AND status = 'queued'
-        AND attempts = $2
-        AND EXISTS (
-          SELECT 1 FROM leases
-           WHERE id = $3 AND task_id = $1 AND released_at IS NULL
-        )
-      RETURNING attempts, job_id, user_id`,
+    `WITH claimed AS (
+       UPDATE tasks
+          SET status='running', started_at=now(), attempts=attempts+1
+        WHERE id = $1
+          AND status = 'queued'
+          AND attempts = $2
+          AND EXISTS (
+            SELECT 1 FROM leases
+             WHERE id = $3 AND task_id = $1 AND released_at IS NULL
+          )
+        RETURNING attempts, job_id, user_id
+     ), job_promoted AS (
+       UPDATE jobs SET status='running'
+        WHERE id IN (SELECT job_id FROM claimed) AND status = 'pending'
+     )
+     SELECT attempts, job_id, user_id FROM claimed`,
     [msg.taskId, msg.attempts, msg.leaseId],
   );
   if (result.rowCount === 0) return null;

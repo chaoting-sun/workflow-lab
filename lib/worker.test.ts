@@ -57,6 +57,51 @@ describe("claimTask", () => {
     expect(row.rows[0].attempts).toBe(fx.attempts + 1);
   });
 
+  it("promotes parent job from 'pending' to 'running' on first claim", async () => {
+    const u = await createUser(`${PREFIX}-claim-job-running`);
+    const fx = await makeQueuedCpuTaskWithLease(u.id);
+
+    const before = await db.query<{ status: string }>(
+      `SELECT status FROM jobs WHERE id=$1`,
+      [fx.jobId],
+    );
+    expect(before.rows[0].status).toBe("pending");
+
+    const claimed = await claimTask({
+      taskId: fx.taskId,
+      leaseId: fx.leaseId,
+      attempts: fx.attempts,
+    });
+    expect(claimed).not.toBeNull();
+
+    const after = await db.query<{ status: string }>(
+      `SELECT status FROM jobs WHERE id=$1`,
+      [fx.jobId],
+    );
+    expect(after.rows[0].status).toBe("running");
+  });
+
+  it("does not overwrite a terminal job status on re-claim", async () => {
+    const u = await createUser(`${PREFIX}-claim-job-terminal`);
+    const fx = await makeQueuedCpuTaskWithLease(u.id);
+    await db.query(
+      `UPDATE jobs SET status='completed', completed_at=now() WHERE id=$1`,
+      [fx.jobId],
+    );
+
+    await claimTask({
+      taskId: fx.taskId,
+      leaseId: fx.leaseId,
+      attempts: fx.attempts,
+    });
+
+    const row = await db.query<{ status: string }>(
+      `SELECT status FROM jobs WHERE id=$1`,
+      [fx.jobId],
+    );
+    expect(row.rows[0].status).toBe("completed");
+  });
+
   it("returns null and does not mutate when status != 'queued'", async () => {
     const u = await createUser(`${PREFIX}-claim-status`);
     const fx = await makeQueuedCpuTaskWithLease(u.id);
