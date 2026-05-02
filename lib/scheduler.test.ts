@@ -180,6 +180,28 @@ describe("dispatchCpu", () => {
     expect(firstUserId).toBe(bob.id);
   });
 
+  it("interleaves dispatch between two jobs of the same user (per-job fairness)", async () => {
+    // Single user submits jobs A then B, each with 3 pending CPU tasks. Without
+    // per-job fairness, j.created_at would drain A entirely before touching B.
+    const u = await createUser(`${PREFIX}-multi-job`);
+    const a = await createJob({ userId: u.id, pipelinesCount: 3 });
+    const b = await createJob({ userId: u.id, pipelinesCount: 3 });
+
+    const queue = new FakeQueue();
+    const n = await dispatchCpu(queue);
+    expect(n).toBe(6);
+
+    const order: string[] = [];
+    for (const m of queue.messages) {
+      const { rows } = await db.query<{ job_id: string }>(
+        `SELECT job_id FROM tasks WHERE id=$1`,
+        [m.taskId],
+      );
+      order.push(rows[0].job_id === a.jobId ? "A" : "B");
+    }
+    expect(order).toEqual(["A", "B", "A", "B", "A", "B"]);
+  });
+
   it("preserves lease + queued status if queue.add throws (reaper recovers later)", async () => {
     const u = await createUser(`${PREFIX}-u`);
     await createJob({ userId: u.id, pipelinesCount: 1 });

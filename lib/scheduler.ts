@@ -33,9 +33,12 @@ async function reserveOneTask(
   leaseTtlMs: number,
 ): Promise<DispatchMessage | null> {
   return db.tx(async (tx) => {
-    // Fairness ordering. The correlated subquery counts active leases of the
-    // same resource per candidate user, evaluated for each row before
-    // SKIP LOCKED applies.
+    // Fairness ordering, evaluated per candidate row before SKIP LOCKED:
+    //   1. active leases of this resource for the candidate's user (cross-user
+    //      fairness — one user's active load can't block another user).
+    //   2. active leases of this resource for the candidate's job (same-user
+    //      fairness — two jobs from one user interleave instead of A draining
+    //      before B starts).
     const pick = await tx.query<{
       task_id: string;
       user_id: string;
@@ -48,6 +51,13 @@ async function reserveOneTask(
         ORDER BY (
                   SELECT count(*) FROM leases l
                    WHERE l.user_id = t.user_id
+                     AND l.resource = $1
+                     AND l.released_at IS NULL
+                ) ASC,
+                 (
+                  SELECT count(*) FROM leases l
+                    JOIN tasks lt ON lt.id = l.task_id
+                   WHERE lt.job_id = t.job_id
                      AND l.resource = $1
                      AND l.released_at IS NULL
                 ) ASC,
