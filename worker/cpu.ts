@@ -2,9 +2,11 @@ import { access } from "node:fs/promises";
 import { getConfig } from "../lib/config";
 import { cpuArtifactPath, writeArtifactFile } from "../lib/artifacts";
 import { sleep } from "../lib/sleep";
+import { withTimeout } from "../lib/timeout";
 import {
   claimTask,
   finalizeCpuSuccess,
+  recordFailure,
   StaleAttemptError,
   startHeartbeat,
   type WorkerTaskMessage,
@@ -15,6 +17,11 @@ function randomBetween(minMs: number, maxMs: number): number {
 }
 
 export type CpuWorkFn = (taskId: string) => Promise<string>;
+
+export interface RunCpuOptions {
+  // Override CPU_TIMEOUT_MS for tests; production uses config.
+  timeoutMs?: number;
+}
 
 export async function defaultCpuWork(taskId: string): Promise<string> {
   const cfg = getConfig();
@@ -29,21 +36,28 @@ export async function defaultCpuWork(taskId: string): Promise<string> {
 //
 // fs.access is the on-disk artifact verification, run BEFORE the finalize
 // transaction — filesystem IO must not happen inside a DB tx.
+//
+// withTimeout caps doWork at CPU_TIMEOUT_MS so a wedged task can never block
+// the worker indefinitely; on timeout (or any other doWork failure) we route
+// through finalizeTaskFailure rather than re-throwing, so BullMQ sees a clean
+// completion and the worker is immediately ready for the next message.
 export async function runCpuTask(
   msg: WorkerTaskMessage,
   doWork: CpuWorkFn = defaultCpuWork,
+  opts: RunCpuOptions = {},
 ): Promise<void> {
   const claimed = await claimTask(msg);
   if (!claimed) return;
 
+  const timeoutMs = opts.timeoutMs ?? getConfig().CPU_TIMEOUT_MS;
   const heartbeat = startHeartbeat(msg.leaseId);
   try {
-    const artifactPath = await doWork(claimed.taskId);
+    const artifactPath = await withTimeout(doWork(claimed.taskId), timeoutMs);
     await access(artifactPath);
     await finalizeCpuSuccess(claimed, msg.leaseId, artifactPath);
   } catch (err) {
     if (err instanceof StaleAttemptError) return;
-    throw err;
+    await recordFailure(claimed, msg.leaseId, err);
   } finally {
     heartbeat.stop();
   }

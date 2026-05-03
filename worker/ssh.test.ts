@@ -9,6 +9,7 @@ import {
   type QueuedTaskFixture,
 } from "../lib/test-helpers";
 import { createUser } from "../lib/users";
+import { sleep } from "../lib/sleep";
 import { runSshTask } from "./ssh";
 import type { WorkerTaskMessage } from "../lib/worker";
 
@@ -161,6 +162,69 @@ describe("runSshTask", () => {
       [fx.jobId],
     );
     expect(train.rows[0].count).toBe("0");
+  });
+
+  it("timeout (retryable): doWork outlasts the timeout → pending with failure_reason='timeout', lease released, no training task created", async () => {
+    const u = await createUser(`${PREFIX}-timeout-retry`);
+    const fx = await makeQueuedSshTaskWithLease(u.id, 1);
+
+    const slowWork = async (taskId: string): Promise<string> => {
+      await sleep(500);
+      return join(scratchDir, `ssh-${taskId}.txt`);
+    };
+
+    await runSshTask(msg(fx), slowWork, { timeoutMs: 30 });
+
+    const t = await db.query<{ status: string; failure_reason: string | null }>(
+      `SELECT status, failure_reason FROM tasks WHERE id=$1`,
+      [fx.taskId],
+    );
+    expect(t.rows[0].status).toBe("pending");
+    expect(t.rows[0].failure_reason).toBe("timeout");
+
+    const lease = await db.query<{ released_at: Date | null }>(
+      `SELECT released_at FROM leases WHERE id=$1`,
+      [fx.leaseId],
+    );
+    expect(lease.rows[0].released_at).not.toBeNull();
+
+    const training = await db.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM tasks WHERE job_id=$1 AND kind='training'`,
+      [fx.jobId],
+    );
+    expect(training.rows[0].count).toBe("0");
+
+    const job = await db.query<{ status: string }>(
+      `SELECT status FROM jobs WHERE id=$1`,
+      [fx.jobId],
+    );
+    expect(job.rows[0].status).not.toBe("failed");
+  });
+
+  it("timeout (terminal): exhausted attempts → status='failed' and job is failed", async () => {
+    const u = await createUser(`${PREFIX}-timeout-final`);
+    const fx = await makeQueuedSshTaskWithLease(u.id, 1);
+    await db.query(`UPDATE tasks SET max_attempts=1 WHERE id=$1`, [fx.taskId]);
+
+    const slowWork = async (taskId: string): Promise<string> => {
+      await sleep(500);
+      return join(scratchDir, `ssh-${taskId}.txt`);
+    };
+
+    await runSshTask(msg(fx), slowWork, { timeoutMs: 30 });
+
+    const t = await db.query<{ status: string; failure_reason: string | null }>(
+      `SELECT status, failure_reason FROM tasks WHERE id=$1`,
+      [fx.taskId],
+    );
+    expect(t.rows[0].status).toBe("failed");
+    expect(t.rows[0].failure_reason).toBe("timeout");
+
+    const job = await db.query<{ status: string }>(
+      `SELECT status FROM jobs WHERE id=$1`,
+      [fx.jobId],
+    );
+    expect(job.rows[0].status).toBe("failed");
   });
 
   it("duplicate delivery is a no-op the second time and barrier fires once", async () => {

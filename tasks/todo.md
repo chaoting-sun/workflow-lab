@@ -41,7 +41,7 @@ Tick a box only when **acceptance criteria + verification steps** for that task 
 ## Phase 3: Resilience layer
 
 - [x] **T10** — Lease heartbeat + scheduler reaper + job-failure propagation — M
-- [ ] **T11** — Per-kind timeouts via `Promise.race` — S
+- [x] **T11** — Per-kind timeouts via `Promise.race` — S
 - [ ] **T12** — Backpressure (CPU paused on SSH backlog) — XS
 - [ ] **T13** — BullMQ `lockDuration` alignment + lock extension + boot-time validation — S
 

@@ -9,6 +9,7 @@ import {
   type QueuedTaskFixture,
 } from "../lib/test-helpers";
 import { createUser } from "../lib/users";
+import { sleep } from "../lib/sleep";
 import { runCpuTask } from "./cpu";
 import type { WorkerTaskMessage } from "../lib/worker";
 
@@ -148,6 +149,78 @@ describe("runCpuTask", () => {
       [fx.taskId],
     );
     expect(child.rows[0].count).toBe("0");
+  });
+
+  it("timeout (retryable): doWork outlasts the timeout → task reset to pending with failure_reason='timeout', lease released, no artifact, no SSH child", async () => {
+    const u = await createUser(`${PREFIX}-timeout-retry`);
+    const fx = await makeQueuedCpuTaskWithLease(u.id);
+
+    const slowWork = async (taskId: string): Promise<string> => {
+      await sleep(500);
+      return join(scratchDir, `cpu-${taskId}.txt`);
+    };
+
+    await runCpuTask(msg(fx), slowWork, { timeoutMs: 30 });
+
+    const task = await db.query<{
+      status: string;
+      failure_reason: string | null;
+    }>(
+      `SELECT status, failure_reason FROM tasks WHERE id=$1`,
+      [fx.taskId],
+    );
+    expect(task.rows[0].status).toBe("pending");
+    expect(task.rows[0].failure_reason).toBe("timeout");
+
+    const lease = await db.query<{ released_at: Date | null }>(
+      `SELECT released_at FROM leases WHERE id=$1`,
+      [fx.leaseId],
+    );
+    expect(lease.rows[0].released_at).not.toBeNull();
+
+    const artifact = await db.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM artifacts WHERE task_id=$1`,
+      [fx.taskId],
+    );
+    expect(artifact.rows[0].count).toBe("0");
+
+    const child = await db.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM tasks WHERE parent_task_id=$1`,
+      [fx.taskId],
+    );
+    expect(child.rows[0].count).toBe("0");
+
+    const job = await db.query<{ status: string }>(
+      `SELECT status FROM jobs WHERE id=$1`,
+      [fx.jobId],
+    );
+    expect(job.rows[0].status).not.toBe("failed");
+  });
+
+  it("timeout (terminal): task on its last attempt → status='failed', job propagates to 'failed'", async () => {
+    const u = await createUser(`${PREFIX}-timeout-final`);
+    const fx = await makeQueuedCpuTaskWithLease(u.id);
+    await db.query(`UPDATE tasks SET max_attempts=1 WHERE id=$1`, [fx.taskId]);
+
+    const slowWork = async (taskId: string): Promise<string> => {
+      await sleep(500);
+      return join(scratchDir, `cpu-${taskId}.txt`);
+    };
+
+    await runCpuTask(msg(fx), slowWork, { timeoutMs: 30 });
+
+    const task = await db.query<{ status: string; failure_reason: string | null }>(
+      `SELECT status, failure_reason FROM tasks WHERE id=$1`,
+      [fx.taskId],
+    );
+    expect(task.rows[0].status).toBe("failed");
+    expect(task.rows[0].failure_reason).toBe("timeout");
+
+    const job = await db.query<{ status: string }>(
+      `SELECT status FROM jobs WHERE id=$1`,
+      [fx.jobId],
+    );
+    expect(job.rows[0].status).toBe("failed");
   });
 
   it("a duplicate delivery of the same message is a no-op the second time", async () => {
