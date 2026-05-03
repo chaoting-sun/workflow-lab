@@ -39,6 +39,7 @@ async function main(): Promise<void> {
     {
       connection: getRedisConnection(),
       lockDuration: cfg.BULLMQ_LOCK_DURATION_MS,
+      concurrency: cfg.CPU_WORKER_CONCURRENCY,
     },
   );
   cpuWorker.on("failed", (job, err) => {
@@ -53,6 +54,7 @@ async function main(): Promise<void> {
     {
       connection: getRedisConnection(),
       lockDuration: cfg.BULLMQ_LOCK_DURATION_MS,
+      concurrency: cfg.SSH_WORKER_CONCURRENCY,
     },
   );
   sshWorker.on("failed", (job, err) => {
@@ -67,6 +69,7 @@ async function main(): Promise<void> {
     {
       connection: getRedisConnection(),
       lockDuration: cfg.BULLMQ_LOCK_DURATION_MS,
+      concurrency: cfg.TRAINING_WORKER_CONCURRENCY,
     },
   );
   trainingWorker.on("failed", (job, err) => {

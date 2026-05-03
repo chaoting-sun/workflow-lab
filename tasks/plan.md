@@ -390,9 +390,37 @@ Goal: the system survives worker crashes, hangs, and bursts of pending SSH work.
 
 ---
 
+#### Task 13b: Per-kind BullMQ worker concurrency (config-driven)
+
+**Description:** Each `Worker` in `worker/index.ts` currently omits `concurrency`, so BullMQ defaults to 1 in-flight job per queue — a single slow CPU/SSH/training task serializes the whole pool. Add three env-driven settings (`CPU_WORKER_CONCURRENCY`, `SSH_WORKER_CONCURRENCY`, `TRAINING_WORKER_CONCURRENCY`) wired through `lib/config.ts`, and pass them into the corresponding `Worker` constructors. Defaults should match the existing slot pools so behavior in a fresh checkout doesn't change qualitatively (the scheduler still throttles via `GLOBAL_*_SLOTS`).
+
+**Acceptance criteria:**
+- [ ] `lib/config.ts` adds `CPU_WORKER_CONCURRENCY`, `SSH_WORKER_CONCURRENCY`, `TRAINING_WORKER_CONCURRENCY` (positive ints) with sensible defaults (suggest: same as `GLOBAL_*_SLOTS` for cpu/ssh, and `GLOBAL_TRAINING_SLOTS` for training).
+- [ ] `worker/index.ts` passes each value as the `concurrency` option to its `Worker`.
+- [ ] `.env.example` documents the three new vars.
+- [ ] Boot still validates the existing `BULLMQ_LOCK_DURATION_MS` invariant — concurrency does not interact with lock duration.
+- [ ] No change to scheduler dispatch logic, lease semantics, or atomic-claim/optimistic-lock paths.
+
+**Verification:**
+- [ ] `pnpm typecheck` clean.
+- [ ] With defaults unset, `parseConfig` succeeds and `cpuWorker.opts.concurrency` matches the documented default.
+- [ ] Set `CPU_WORKER_CONCURRENCY=4`, submit a job with `PIPELINES_PER_JOB=10` and `GLOBAL_CPU_SLOTS=10`: observe up to 4 CPU jobs running concurrently in BullMQ (still gated by scheduler dispatch slots).
+- [ ] Set any of the three to `0` or non-numeric → boot exits with a clear zod error.
+
+**Dependencies:** Task 13
+
+**Files likely touched:**
+- `lib/config.ts`
+- `worker/index.ts`
+- `.env.example`
+
+**Estimated scope:** XS
+
+---
+
 ### Checkpoint C: Resilience verified
 
-- [ ] Tasks 10–13 complete.
+- [ ] Tasks 10–13b complete.
 - [ ] Manual `kill -9` of worker mid-flight → job still completes.
 - [ ] Forced timeouts → tasks fail cleanly; no wedged worker.
 - [ ] Backpressure observed in dashboard / `psql`.

@@ -33,6 +33,10 @@ const schema = z
 
     BULLMQ_LOCK_DURATION_MS: intMs,
 
+    CPU_WORKER_CONCURRENCY: z.coerce.number().int().positive().default(20),
+    SSH_WORKER_CONCURRENCY: z.coerce.number().int().positive().default(40),
+    TRAINING_WORKER_CONCURRENCY: z.coerce.number().int().positive().default(4),
+
     MAX_ATTEMPTS: z.coerce.number().int().min(1),
 
     SSH_BACKPRESSURE_THRESHOLD: intCount,

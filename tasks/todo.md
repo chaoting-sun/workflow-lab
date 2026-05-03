@@ -44,6 +44,7 @@ Tick a box only when **acceptance criteria + verification steps** for that task 
 - [x] **T11** — Per-kind timeouts via `Promise.race` — S
 - [x] **T12** — Backpressure (CPU paused on SSH backlog) — XS
 - [x] **T13** — BullMQ `lockDuration` alignment + lock extension + boot-time validation — S
+- [ ] **T13b** — Per-kind BullMQ worker concurrency (config-driven `CPU_WORKER_CONCURRENCY` / `SSH_WORKER_CONCURRENCY` / `TRAINING_WORKER_CONCURRENCY`) — XS
 
 ### ✅ Checkpoint C — Resilience
 
