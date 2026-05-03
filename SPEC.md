@@ -548,7 +548,7 @@ ARTIFACTS_DIR=./artifacts
 ### Ask first
 - Adding a new dependency beyond: `next`, `react`, `react-dom`, `pg`, `bullmq`, `ioredis`, `zod`, `tailwindcss`, `typescript`, `tsx`.
 - Adding priority tiers, per-user quotas, or deadline-aware scheduling.
-- Splitting the worker into multiple processes.
+- Splitting the worker into multiple processes (planned — see §13).
 - Switching from single `package.json` to a pnpm workspace.
 - Changing barrier semantics (e.g. allowing partial-success training).
 - Cancelling already-running tasks on job failure. Default is "let them finish, ignore the result".
@@ -593,3 +593,98 @@ These edge cases exist but are deliberately not addressed:
 - **Cancelling an in-flight job** (no `DELETE /api/jobs/:id`) — once submitted, jobs run to completion or failure.
 - **Horizontal scaling** — single scheduler is enforced; no leader election across processes.
 - **Drift in chaos rates over time** — chaos is per-task probability, not per-second rate. At low rates this can produce streaks. Acceptable for manual verification.
+
+---
+
+## 13. Planned change — multi-process scaling for CPU-bound work
+
+**Status**: planned, not implemented. Current system keeps scheduler + all three BullMQ workers in one Node process (`worker/index.ts`). This section records the intended target shape so we don't lose context. Short term we keep the existing single-process layout.
+
+### 13.1 Motivation
+
+CPU tasks are currently simulated with `sleep` (I/O-bound), so a single Node event loop can multiplex them via `concurrency`. The lab is expected to evolve toward **real CPU-bound** CPU tasks (synchronous compute — matrix ops, hashing, etc.). At that point:
+
+1. A single Node main thread can saturate **at most one core**, regardless of BullMQ `concurrency`.
+2. Synchronous compute blocks the event loop, which **freezes the lease heartbeat (`startHeartbeat` setInterval) and BullMQ lock renewal** for the duration of the work. Side effects:
+   - Lease `expires_at` slips past `now()` while the worker is busy → reaper resets the task to `pending` → BullMQ re-delivers to a second worker → duplicate execution + `StaleAttemptError` on the original finalize.
+   - BullMQ `lockDuration` (currently aligned via `BULLMQ_LOCK_DURATION_MS`) cannot be extended in time → double-delivery on the BullMQ side as well.
+   - `attempts` inflates against `MAX_ATTEMPTS`, eventually permanent-failing the task.
+
+Scaling fan-out across the available cores (target: ~20) is therefore both a **throughput** problem and a **correctness** problem.
+
+### 13.2 Target architecture
+
+Two changes, complementary:
+
+#### (a) Split `scheduler` and `worker` into separate process entries
+
+`worker/index.ts` currently bundles three things: advisory-lock acquisition, scheduler tick loop, three BullMQ workers. Once we want N worker replicas, the advisory lock forces N−1 of them to exit (§3.9). So we split:
+
+```
+scheduler/index.ts   →  acquireSchedulerLock + runSchedulerLoop  (replicas = 1)
+worker/index.ts      →  BullMQ workers only, role-selectable     (replicas = N)
+```
+
+`worker/index.ts` reads `WORKER_ROLE` from env and starts the appropriate workers:
+
+| `WORKER_ROLE` | Workers started | `concurrency` | Replicas | Rationale |
+|---|---|---|---|---|
+| `cpu` | `cpu` only | **1** | ~`GLOBAL_CPU_SLOTS` (≈18–20) | one CPU-bound process per core |
+| `io` | `ssh` + `training` | high (`SSH_WORKER_CONCURRENCY` / `TRAINING_WORKER_CONCURRENCY`) | 1–2 | I/O-bound; event loop multiplexes |
+
+`package.json` gains:
+```json
+"scheduler":  "tsx --env-file=.env scheduler/index.ts",
+"worker:cpu": "WORKER_ROLE=cpu tsx --env-file=.env worker/index.ts",
+"worker:io":  "WORKER_ROLE=io  tsx --env-file=.env worker/index.ts"
+```
+
+`acquireSchedulerLock` is removed from the worker entry — only the scheduler process holds the lock. Worker processes do not need it (BullMQ + Redis already make `cpu`/`ssh`/`training` queue consumption atomic).
+
+#### (b) Run actual CPU work in `worker_threads` inside each CPU worker process
+
+This is independent of (a) and is **required as soon as `defaultCpuWork` becomes synchronous compute** — even with one process per core, blocking the main thread breaks the heartbeat and BullMQ lock renewal as described in §13.1.
+
+Shape:
+
+```
+worker/cpu.ts          →  defaultCpuWork spawns worker_threads.Worker(cpu-thread.js),
+                          awaits its message / exit.
+                          On withTimeout rejection, terminate() the thread.
+worker/cpu-thread.ts   →  runs the synchronous compute, writes the artifact,
+                          parentPort.postMessage(artifactPath).
+```
+
+Effect: the BullMQ worker's main thread stays free to:
+- run the `startHeartbeat` `setInterval` against the lease,
+- service the BullMQ lock-renewal callback,
+- honour `withTimeout` on `CPU_TIMEOUT_MS`.
+
+`runCpuTask`'s atomic claim, optimistic lock, artifact verification, and finalize remain unchanged — only `doWork` moves to a thread.
+
+### 13.3 Slot-cap re-tuning
+
+When the architecture lands, re-evaluate config:
+
+- `GLOBAL_CPU_SLOTS` should match the deployed count of `worker:cpu` processes (e.g. 18 if we leave 2 cores headroom for scheduler + IO worker + OS).
+- `SSH_BACKPRESSURE_THRESHOLD` may need to scale with the larger CPU throughput, otherwise SSH backlog hits the gate too easily and CPU dispatch stalls.
+- `BULLMQ_LOCK_DURATION_MS` and `LEASE_TTL_MS` interact with worker_threads: even with the thread split, set them generously (TTL ≥ heartbeat × 6 stays the right rule).
+
+### 13.4 What does NOT change
+
+- DB schema, fairness algorithm (§3.3), barrier (§3.5), reaper (§3.6), failure semantics (§3.7), backpressure logic (§3.8) — all single-instance scheduler invariants are preserved by the advisory lock living in the dedicated `scheduler/` process.
+- Public API (§4) and dashboard (§5).
+- BullMQ queue names and message shapes.
+- Single `package.json` layout (§3 / §6) — no workspace split.
+
+### 13.5 Sequencing (for future implementation)
+
+In rough dependency order, not committed to phases yet:
+
+1. **Move CPU-bound work to `worker_threads`** (no process split yet). This is also the prerequisite for `defaultCpuWork` ever being real compute. Owns its own correctness story (heartbeat + BullMQ lock renewal stay alive).
+2. **Extract `scheduler/index.ts`** from `worker/index.ts`; add `WORKER_ROLE` switch in `worker/index.ts`; add `package.json` scripts.
+3. **Process supervisor wiring** (pm2 / Docker Compose / systemd template) to run 1× scheduler, ~18× `worker:cpu`, 1–2× `worker:io`.
+4. **Re-tune `GLOBAL_CPU_SLOTS` and `SSH_BACKPRESSURE_THRESHOLD`** against the new fan-out.
+5. **Manual verification** that fairness (§9.5) and backpressure (§9.6) still hold under the multi-process layout.
+
+Until these land, the existing single-process worker is the supported configuration.

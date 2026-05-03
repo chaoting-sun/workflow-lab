@@ -48,10 +48,10 @@ Tick a box only when **acceptance criteria + verification steps** for that task 
 
 ### ✅ Checkpoint C — Resilience
 
-- [ ] `kill -9` worker mid-flight → job still completes
-- [ ] Forced timeouts → tasks fail cleanly, no wedged worker
-- [ ] Backpressure observed
-- [ ] Human review
+- [x] `kill -9` worker mid-flight → job still completes
+- [x] Forced timeouts → tasks fail cleanly, no wedged worker
+- [x] Backpressure observed
+- [x] Human review
 
 ---
 
@@ -73,3 +73,23 @@ Tick a box only when **acceptance criteria + verification steps** for that task 
 ## Open / blocked
 
 (none right now — surface here as work proceeds)
+
+---
+
+## Phase 5: Multi-process / multi-core scaling (planned, deferred)
+
+Spec reference: SPEC §13. Motivation: once `defaultCpuWork` becomes real CPU-bound compute, a single Node process saturates one core AND blocks the lease heartbeat / BullMQ lock renewal, causing duplicate execution. Short term we keep the existing single-process `worker/index.ts`; this phase records the planned shape.
+
+- [ ] **T17** — Move `defaultCpuWork` into `worker_threads` (`worker/cpu-thread.ts`); main thread keeps heartbeat + BullMQ lock renewal + `withTimeout` alive; `terminate()` the thread on timeout. Prerequisite for T18 to be useful, but valuable on its own. — M
+- [ ] **T18** — Extract `scheduler/index.ts` (advisory lock + `runSchedulerLoop` only); strip lock + scheduler loop out of `worker/index.ts`; add `WORKER_ROLE=cpu|io` switch; add `pnpm scheduler` / `pnpm worker:cpu` / `pnpm worker:io` scripts. — M
+- [ ] **T19** — Process supervisor (pm2 / Docker Compose / systemd template) running 1× scheduler, ~18× `worker:cpu` (`concurrency=1`), 1–2× `worker:io` (high `concurrency`). — S
+- [ ] **T20** — Re-tune `GLOBAL_CPU_SLOTS` to match deployed `worker:cpu` replicas; re-evaluate `SSH_BACKPRESSURE_THRESHOLD` against new CPU throughput. — XS
+- [ ] **T21** — Re-run SPEC §9.5 (fairness) and §9.6 (backpressure) under the multi-process layout; document results in `tasks/verification.md`. — S
+
+### ✅ Checkpoint E — Multi-core scaling
+
+- [ ] CPU-bound `defaultCpuWork` no longer triggers spurious lease reaps under load
+- [ ] `htop` shows N CPU worker processes spread across cores during a job run
+- [ ] SPEC §9.5 fairness still holds with N CPU worker replicas
+- [ ] SPEC §9.6 backpressure still gates CPU dispatch correctly
+- [ ] Human review
