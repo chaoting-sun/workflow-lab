@@ -241,18 +241,13 @@ describe("dispatchCpu", () => {
   });
 });
 
-describe("dispatchCpu — SSH backpressure (T12)", () => {
-  // .env.example sets SSH_BACKPRESSURE_THRESHOLD=80. We forge exactly that
-  // many SSH rows in active states so the backlog gate trips, then assert
-  // CPU dispatch is paused for the tick.
+describe("dispatchCpu — SSH backpressure", () => {
   it("skips CPU dispatch when SSH backlog >= SSH_BACKPRESSURE_THRESHOLD", async () => {
     const cfg = getConfig();
     const filler = await createUser(`${PREFIX}-bp-filler`);
-    await makeSshTasksWithStatus(
-      filler.id,
-      cfg.SSH_BACKPRESSURE_THRESHOLD,
-      "pending",
-    );
+    await makeSshTasks(filler.id, cfg.SSH_BACKPRESSURE_THRESHOLD, {
+      succeedParents: true,
+    });
 
     const u = await createUser(`${PREFIX}-bp-cpu`);
     await createJob({ userId: u.id, pipelinesCount: 5 });
@@ -261,7 +256,6 @@ describe("dispatchCpu — SSH backpressure (T12)", () => {
     expect(await dispatchCpu(queue)).toBe(0);
     expect(queue.messages).toEqual([]);
 
-    // No CPU lease was created and no task was flipped to 'queued'.
     const queued = await db.query<{ count: string }>(
       `SELECT count(*)::text AS count
          FROM tasks WHERE user_id=$1 AND status='queued'`,
@@ -279,18 +273,16 @@ describe("dispatchCpu — SSH backpressure (T12)", () => {
   it("counts pending, queued, and running SSH tasks toward the backlog", async () => {
     const cfg = getConfig();
     const t = cfg.SSH_BACKPRESSURE_THRESHOLD;
-    // Split the threshold across all three counted statuses to confirm the
-    // SQL filter mirrors SPEC §3.8.
     const a = Math.floor(t / 3);
     const b = Math.floor(t / 3);
     const c = t - a - b;
 
     const u1 = await createUser(`${PREFIX}-bp-pending`);
-    await makeSshTasksWithStatus(u1.id, a, "pending");
+    await makeSshTasks(u1.id, a, { status: "pending", succeedParents: true });
     const u2 = await createUser(`${PREFIX}-bp-queued`);
-    await makeSshTasksWithStatus(u2.id, b, "queued");
+    await makeSshTasks(u2.id, b, { status: "queued", succeedParents: true });
     const u3 = await createUser(`${PREFIX}-bp-running`);
-    await makeSshTasksWithStatus(u3.id, c, "running");
+    await makeSshTasks(u3.id, c, { status: "running", succeedParents: true });
 
     const target = await createUser(`${PREFIX}-bp-target`);
     await createJob({ userId: target.id, pipelinesCount: 3 });
@@ -301,14 +293,10 @@ describe("dispatchCpu — SSH backpressure (T12)", () => {
 
   it("does not count succeeded or failed SSH tasks toward the backlog", async () => {
     const cfg = getConfig();
-    // Forge threshold-many SSH rows in *terminal* states; backlog must still
-    // read 0 and CPU dispatch must proceed.
     const filler = await createUser(`${PREFIX}-bp-terminal`);
-    await makeSshTasksWithStatus(
-      filler.id,
-      cfg.SSH_BACKPRESSURE_THRESHOLD,
-      "pending",
-    );
+    await makeSshTasks(filler.id, cfg.SSH_BACKPRESSURE_THRESHOLD, {
+      succeedParents: true,
+    });
     await db.query(
       `UPDATE tasks SET status='succeeded'
          WHERE user_id=$1 AND kind='ssh'`,
@@ -325,21 +313,17 @@ describe("dispatchCpu — SSH backpressure (T12)", () => {
   it("resumes CPU dispatch once SSH backlog drops below the threshold", async () => {
     const cfg = getConfig();
     const filler = await createUser(`${PREFIX}-bp-resume-filler`);
-    await makeSshTasksWithStatus(
-      filler.id,
-      cfg.SSH_BACKPRESSURE_THRESHOLD,
-      "pending",
-    );
+    await makeSshTasks(filler.id, cfg.SSH_BACKPRESSURE_THRESHOLD, {
+      succeedParents: true,
+    });
 
     const u = await createUser(`${PREFIX}-bp-resume`);
     await createJob({ userId: u.id, pipelinesCount: 4 });
 
-    // Tick 1: gate trips → 0 dispatched.
     const queue = new FakeQueue();
     expect(await dispatchCpu(queue)).toBe(0);
 
-    // Drain one SSH task so backlog == threshold - 1. Postgres rejects LIMIT
-    // directly on UPDATE; subquery is the standard idiom.
+    // Postgres rejects LIMIT directly on UPDATE; subquery is the standard idiom.
     await db.query(
       `UPDATE tasks SET status='succeeded'
          WHERE id = (
@@ -350,24 +334,21 @@ describe("dispatchCpu — SSH backpressure (T12)", () => {
       [filler.id],
     );
 
-    // Tick 2: gate clears → CPU dispatch proceeds normally.
     expect(await dispatchCpu(queue)).toBe(4);
   });
 
   it("does not gate dispatchSsh on SSH backpressure", async () => {
+    // Running SSH rows count toward backlog but consume no SSH-lease slots
+    // (no lease rows), so dispatchSsh can still drain pending SSH work.
     const cfg = getConfig();
-    // Forge threshold-many *running* SSH rows — those count toward the
-    // backlog but do NOT consume SSH-lease slots (no lease rows). dispatchSsh
-    // must still drain pending SSH work up to GLOBAL_SSH_SLOTS.
     const filler = await createUser(`${PREFIX}-bp-ssh-filler`);
-    await makeSshTasksWithStatus(
-      filler.id,
-      cfg.SSH_BACKPRESSURE_THRESHOLD,
-      "running",
-    );
+    await makeSshTasks(filler.id, cfg.SSH_BACKPRESSURE_THRESHOLD, {
+      status: "running",
+      succeedParents: true,
+    });
 
     const u = await createUser(`${PREFIX}-bp-ssh-target`);
-    await makePendingSshTasks(u.id, 3);
+    await makeSshTasks(u.id, 3);
 
     const queue = new FakeQueue();
     expect(await dispatchSsh(queue)).toBe(3);
@@ -376,11 +357,9 @@ describe("dispatchCpu — SSH backpressure (T12)", () => {
   it("does not gate dispatchTraining on SSH backpressure", async () => {
     const cfg = getConfig();
     const filler = await createUser(`${PREFIX}-bp-train-filler`);
-    await makeSshTasksWithStatus(
-      filler.id,
-      cfg.SSH_BACKPRESSURE_THRESHOLD,
-      "pending",
-    );
+    await makeSshTasks(filler.id, cfg.SSH_BACKPRESSURE_THRESHOLD, {
+      succeedParents: true,
+    });
 
     const u = await createUser(`${PREFIX}-bp-train-target`);
     const job = await createJob({ userId: u.id, pipelinesCount: 1 });
@@ -395,36 +374,19 @@ describe("dispatchCpu — SSH backpressure (T12)", () => {
   });
 });
 
-// Forge `count` pending SSH tasks under one user (sharing a job) without
-// running the CPU stage. Returns the job id.
-async function makePendingSshTasks(
+// Forge `count` SSH tasks under one user (sharing a job), each parented to a
+// CPU sibling. Parents stay pending by default so dispatchSsh tests can
+// assert on CPU state; succeedParents=true clears them out for tests that
+// run dispatchCpu against an isolated target user.
+async function makeSshTasks(
   userId: string,
   count: number,
+  opts: {
+    status?: "pending" | "queued" | "running";
+    succeedParents?: boolean;
+  } = {},
 ): Promise<string> {
-  const job = await createJob({ userId, pipelinesCount: count });
-  const cpus = await db.query<{ id: string }>(
-    `SELECT id FROM tasks WHERE job_id=$1 AND kind='cpu' ORDER BY created_at`,
-    [job.jobId],
-  );
-  for (const c of cpus.rows) {
-    await db.query(
-      `INSERT INTO tasks (job_id, user_id, kind, status, parent_task_id)
-         VALUES ($1, $2, 'ssh', 'pending', $3)`,
-      [job.jobId, userId, c.id],
-    );
-  }
-  return job.jobId;
-}
-
-// Bulk-forge `count` SSH tasks with an arbitrary status. Used by the
-// backpressure tests to push the SSH backlog past the threshold cheaply
-// (one INSERT per call instead of N). The parent CPU tasks are marked
-// succeeded so they don't pollute concurrent dispatchCpu assertions.
-async function makeSshTasksWithStatus(
-  userId: string,
-  count: number,
-  status: "pending" | "queued" | "running",
-): Promise<void> {
+  const status = opts.status ?? "pending";
   const job = await createJob({ userId, pipelinesCount: count });
   await db.query(
     `INSERT INTO tasks (job_id, user_id, kind, status, parent_task_id)
@@ -433,11 +395,14 @@ async function makeSshTasksWithStatus(
         WHERE t.job_id = $1 AND t.kind = 'cpu'`,
     [job.jobId, userId, status],
   );
-  await db.query(
-    `UPDATE tasks SET status='succeeded'
-       WHERE job_id=$1 AND kind='cpu'`,
-    [job.jobId],
-  );
+  if (opts.succeedParents) {
+    await db.query(
+      `UPDATE tasks SET status='succeeded'
+         WHERE job_id=$1 AND kind='cpu'`,
+      [job.jobId],
+    );
+  }
+  return job.jobId;
 }
 
 describe("dispatchSsh", () => {
@@ -449,7 +414,7 @@ describe("dispatchSsh", () => {
 
   it("dispatches all pending SSH tasks under the GLOBAL_SSH_SLOTS cap, marks them queued, creates SSH leases", async () => {
     const u = await createUser(`${PREFIX}-ssh-u`);
-    const jobId = await makePendingSshTasks(u.id, 3);
+    const jobId = await makeSshTasks(u.id, 3);
 
     const queue = new FakeQueue();
     const n = await dispatchSsh(queue);
@@ -480,7 +445,7 @@ describe("dispatchSsh", () => {
     await fillActiveCpuLeases(filler.id, 20);
 
     const u = await createUser(`${PREFIX}-ssh-u2`);
-    await makePendingSshTasks(u.id, 2);
+    await makeSshTasks(u.id, 2);
 
     const queue = new FakeQueue();
     const n = await dispatchSsh(queue);

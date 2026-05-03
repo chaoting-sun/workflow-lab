@@ -101,9 +101,6 @@ async function countActiveLeases(resource: DispatchKind): Promise<number> {
   return Number(rows[0].count);
 }
 
-// SPEC §3.8: counts pending+queued+running SSH tasks. Used by the CPU
-// dispatch gate to pause CPU production when downstream SSH workers can't
-// keep up. SSH and training dispatch are unaffected.
 async function countSshBacklog(): Promise<number> {
   const { rows } = await db.query<{ count: string }>(
     `SELECT count(*)::text AS count
@@ -198,9 +195,9 @@ export async function reapExpiredLeases(): Promise<number> {
 }
 
 export async function dispatchCpu(queue: DispatchQueue): Promise<number> {
-  // SPEC §3.8: pause CPU production when SSH backlog has reached the
-  // threshold. Sacrifices strict per-user fairness for system stability —
-  // without this, CPU work outpaces SSH and pending SSH grows unbounded.
+  // Pause CPU production when the SSH backlog reaches the threshold.
+  // Without this gate, CPU work outpaces SSH and pending SSH grows
+  // unbounded; the trade-off is global rather than per-user fairness.
   const cfg = getConfig();
   const backlog = await countSshBacklog();
   if (backlog >= cfg.SSH_BACKPRESSURE_THRESHOLD) return 0;
