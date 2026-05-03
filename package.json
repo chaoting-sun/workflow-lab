@@ -9,7 +9,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "worker": "tsx worker/index.ts",
+    "worker": "tsx --env-file=.env worker/index.ts",
     "db:reset": "psql \"$DATABASE_URL\" -f db/schema.sql"
   },
   "dependencies": {
