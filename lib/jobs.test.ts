@@ -4,6 +4,7 @@ import { ensureSchema } from "./test-helpers";
 import { createUser } from "./users";
 import {
   createJob,
+  failJob,
   getJob,
   listJobs,
   UserNotFoundError,
@@ -168,6 +169,65 @@ describe("getJob", () => {
       ssh: { done: 1, total: 3, failed: 0 },
       training: { done: 0, total: 1, failed: 0 },
     });
+  });
+});
+
+describe("failJob", () => {
+  it("marks a 'pending' job as 'failed' with completed_at set", async () => {
+    const { jobId } = await createJob({ userId: userA, pipelinesCount: 1 });
+    await failJob(db, jobId);
+
+    const { rows } = await db.query<{
+      status: string;
+      completed_at: Date | null;
+    }>(`SELECT status, completed_at FROM jobs WHERE id=$1`, [jobId]);
+    expect(rows[0].status).toBe("failed");
+    expect(rows[0].completed_at).not.toBeNull();
+  });
+
+  it("marks a 'running' job as 'failed'", async () => {
+    const { jobId } = await createJob({ userId: userA, pipelinesCount: 1 });
+    await db.query(`UPDATE jobs SET status='running' WHERE id=$1`, [jobId]);
+    await failJob(db, jobId);
+
+    const { rows } = await db.query<{ status: string }>(
+      `SELECT status FROM jobs WHERE id=$1`,
+      [jobId],
+    );
+    expect(rows[0].status).toBe("failed");
+  });
+
+  it("does not overwrite 'completed' status", async () => {
+    const { jobId } = await createJob({ userId: userA, pipelinesCount: 1 });
+    await db.query(
+      `UPDATE jobs SET status='completed', completed_at=now() WHERE id=$1`,
+      [jobId],
+    );
+    await failJob(db, jobId);
+
+    const { rows } = await db.query<{ status: string }>(
+      `SELECT status FROM jobs WHERE id=$1`,
+      [jobId],
+    );
+    expect(rows[0].status).toBe("completed");
+  });
+
+  it("is idempotent on an already-failed job (no completed_at clobber)", async () => {
+    const { jobId } = await createJob({ userId: userA, pipelinesCount: 1 });
+    await failJob(db, jobId);
+    const first = await db.query<{ completed_at: Date }>(
+      `SELECT completed_at FROM jobs WHERE id=$1`,
+      [jobId],
+    );
+
+    await failJob(db, jobId);
+    const second = await db.query<{ completed_at: Date }>(
+      `SELECT completed_at FROM jobs WHERE id=$1`,
+      [jobId],
+    );
+    expect(second.rows[0].completed_at.getTime()).toBe(
+      first.rows[0].completed_at.getTime(),
+    );
   });
 });
 

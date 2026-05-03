@@ -1,4 +1,4 @@
-import { db } from "./db";
+import { db, type Queryable } from "./db";
 import type {
   JobProgress,
   JobStatus,
@@ -100,6 +100,19 @@ export async function createJob(input: CreateJobInput): Promise<CreateJobResult>
       pipelinesCount: input.pipelinesCount,
     };
   });
+}
+
+// Idempotent permanent-failure transition. The `status NOT IN
+// ('completed','failed')` guard means a successful retry that reached
+// 'completed' first is preserved, and re-calling on an already-failed job
+// leaves completed_at untouched.
+export async function failJob(client: Queryable, jobId: string): Promise<void> {
+  await client.query(
+    `UPDATE jobs
+        SET status='failed', completed_at=now()
+      WHERE id=$1 AND status NOT IN ('completed','failed')`,
+    [jobId],
+  );
 }
 
 function emptyProgress(pipelinesCount: number): JobProgress {
