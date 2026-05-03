@@ -1,6 +1,15 @@
-import { db } from "./db";
+import { db, type Queryable } from "./db";
 import { getConfig } from "./config";
 import { runBarrierCheck } from "./barrier";
+
+export async function releaseLease(
+  client: Queryable,
+  leaseId: string,
+): Promise<void> {
+  await client.query(`UPDATE leases SET released_at=now() WHERE id=$1`, [
+    leaseId,
+  ]);
+}
 
 export interface WorkerTaskMessage {
   taskId: string;
@@ -92,9 +101,7 @@ export async function finalizeCpuSuccess(
       [claimed.taskId, artifactPath],
     );
 
-    await tx.query(`UPDATE leases SET released_at=now() WHERE id=$1`, [
-      leaseId,
-    ]);
+    await releaseLease(tx, leaseId);
 
     // Partial unique index on tasks (parent_task_id) WHERE kind='ssh'
     // makes the SSH-child insert idempotent across retried finalizes.
@@ -125,9 +132,7 @@ export async function finalizeTrainingSuccess(
     );
     if (upd.rowCount === 0) throw new StaleAttemptError();
 
-    await tx.query(`UPDATE leases SET released_at=now() WHERE id=$1`, [
-      leaseId,
-    ]);
+    await releaseLease(tx, leaseId);
 
     await tx.query(
       `UPDATE jobs
@@ -162,9 +167,7 @@ export async function finalizeSshSuccess(
       [claimed.taskId, artifactPath],
     );
 
-    await tx.query(`UPDATE leases SET released_at=now() WHERE id=$1`, [
-      leaseId,
-    ]);
+    await releaseLease(tx, leaseId);
 
     await runBarrierCheck(tx, claimed.jobId);
   });
