@@ -101,6 +101,18 @@ async function countActiveLeases(resource: DispatchKind): Promise<number> {
   return Number(rows[0].count);
 }
 
+// SPEC §3.8: counts pending+queued+running SSH tasks. Used by the CPU
+// dispatch gate to pause CPU production when downstream SSH workers can't
+// keep up. SSH and training dispatch are unaffected.
+async function countSshBacklog(): Promise<number> {
+  const { rows } = await db.query<{ count: string }>(
+    `SELECT count(*)::text AS count
+       FROM tasks
+      WHERE kind='ssh' AND status IN ('pending','queued','running')`,
+  );
+  return Number(rows[0].count);
+}
+
 // Crash safety: if `queue.add` throws after the lease has been committed, the
 // task is left as 'queued' with an active lease but no BullMQ message. The
 // reaper resets it on lease expiry. We propagate the error so the caller stops
@@ -186,7 +198,13 @@ export async function reapExpiredLeases(): Promise<number> {
 }
 
 export async function dispatchCpu(queue: DispatchQueue): Promise<number> {
-  return dispatchKind(queue, "cpu", getConfig().GLOBAL_CPU_SLOTS);
+  // SPEC §3.8: pause CPU production when SSH backlog has reached the
+  // threshold. Sacrifices strict per-user fairness for system stability —
+  // without this, CPU work outpaces SSH and pending SSH grows unbounded.
+  const cfg = getConfig();
+  const backlog = await countSshBacklog();
+  if (backlog >= cfg.SSH_BACKPRESSURE_THRESHOLD) return 0;
+  return dispatchKind(queue, "cpu", cfg.GLOBAL_CPU_SLOTS);
 }
 
 export async function dispatchSsh(queue: DispatchQueue): Promise<number> {

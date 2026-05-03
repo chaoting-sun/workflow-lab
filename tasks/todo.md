@@ -42,7 +42,7 @@ Tick a box only when **acceptance criteria + verification steps** for that task 
 
 - [x] **T10** — Lease heartbeat + scheduler reaper + job-failure propagation — M
 - [x] **T11** — Per-kind timeouts via `Promise.race` — S
-- [ ] **T12** — Backpressure (CPU paused on SSH backlog) — XS
+- [x] **T12** — Backpressure (CPU paused on SSH backlog) — XS
 - [ ] **T13** — BullMQ `lockDuration` alignment + lock extension + boot-time validation — S
 
 ### ✅ Checkpoint C — Resilience
