@@ -1,6 +1,8 @@
 import { db, type Queryable } from "./db";
 import { getConfig } from "./config";
 import { runBarrierCheck } from "./barrier";
+import { failJob } from "./jobs";
+import { TimeoutError } from "./timeout";
 
 export async function releaseLease(
   client: Queryable,
@@ -198,6 +200,84 @@ export async function finalizeTrainingSuccess(
       [claimed.jobId],
     );
   });
+}
+
+// Worker-side failure finalize. Writes status='pending' (retryable) or
+// 'failed' (terminal) along with failure_reason in one optimistic-locked
+// UPDATE; releases the lease (idempotent on already-released leases); on a
+// terminal failure, propagates jobs.status='failed' so barriers waiting on
+// the dead task don't hang forever.
+//
+// Returns false if the optimistic guard rejected the write (a parallel reaper
+// or worker mutated `attempts` since our claim), true otherwise. The caller
+// should treat false as "another actor handled the outcome — drop it".
+export async function finalizeTaskFailure(
+  claimed: ClaimedTask,
+  leaseId: string,
+  reason: string,
+): Promise<boolean> {
+  return db.tx(async (tx) => {
+    // The CASE branches read max_attempts from the same row the WHERE clause
+    // matched, so we never race a concurrent UPDATE of max_attempts.
+    // started_at is reset on retry so the next claim's started_at reflects
+    // the actual run start; on terminal failure we leave it alone for audit.
+    const upd = await tx.query<{ status: string }>(
+      `UPDATE tasks
+          SET status = CASE
+                         WHEN attempts >= max_attempts THEN 'failed'
+                         ELSE 'pending'
+                       END,
+              failure_reason = $3,
+              finished_at = CASE
+                              WHEN attempts >= max_attempts THEN now()
+                              ELSE NULL
+                            END,
+              started_at = CASE
+                             WHEN attempts >= max_attempts THEN started_at
+                             ELSE NULL
+                           END
+        WHERE id=$1 AND attempts=$2 AND status='running'
+        RETURNING status`,
+      [claimed.taskId, claimed.myAttempts, reason],
+    );
+    if (upd.rowCount === 0) return false;
+
+    await tx.query(
+      `UPDATE leases SET released_at=now()
+        WHERE id=$1 AND released_at IS NULL`,
+      [leaseId],
+    );
+
+    if (upd.rows[0].status === "failed") {
+      await failJob(tx, claimed.jobId);
+    }
+    return true;
+  });
+}
+
+function failureReason(err: unknown): string {
+  if (err instanceof TimeoutError) return err.kind;
+  return "error";
+}
+
+// Worker-side wrapper around finalizeTaskFailure: maps the thrown error to a
+// failure_reason and swallows DB errors from the failure path itself. The
+// failure path must NOT bubble to BullMQ — that would mark the queue job
+// failed and desync from our DB-as-source-of-truth model. A truly broken
+// finalize is left to the lease reaper.
+export async function recordFailure(
+  claimed: ClaimedTask,
+  leaseId: string,
+  err: unknown,
+): Promise<void> {
+  try {
+    await finalizeTaskFailure(claimed, leaseId, failureReason(err));
+  } catch (failErr) {
+    console.error(
+      `finalizeTaskFailure failed for task ${claimed.taskId}:`,
+      failErr,
+    );
+  }
 }
 
 // The barrier check may insert a single training task once every SSH artifact

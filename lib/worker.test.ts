@@ -9,6 +9,7 @@ import { createUser } from "./users";
 import {
   claimTask,
   finalizeCpuSuccess,
+  finalizeTaskFailure,
   StaleAttemptError,
   startHeartbeat,
   type ClaimedTask,
@@ -286,6 +287,148 @@ describe("finalizeCpuSuccess", () => {
       [fx.taskId],
     );
     expect(child.rows[0].count).toBe("1");
+  });
+});
+
+describe("finalizeTaskFailure", () => {
+  async function claim(fx: QueuedTaskFixture): Promise<ClaimedTask> {
+    const c = await claimTask({
+      taskId: fx.taskId,
+      leaseId: fx.leaseId,
+      attempts: fx.attempts,
+    });
+    if (!c) throw new Error("setup: claim failed");
+    return c;
+  }
+
+  it("retryable (attempts < max_attempts): resets task to pending, sets failure_reason, releases lease, leaves job unfailed", async () => {
+    const u = await createUser(`${PREFIX}-fail-retry`);
+    const fx = await makeQueuedCpuTaskWithLease(u.id);
+    // max_attempts default = 3; first claim brings attempts to 1.
+    const claimed = await claim(fx);
+
+    const ok = await finalizeTaskFailure(claimed, fx.leaseId, "timeout");
+    expect(ok).toBe(true);
+
+    const task = await db.query<{
+      status: string;
+      failure_reason: string | null;
+      finished_at: Date | null;
+      started_at: Date | null;
+      attempts: number;
+    }>(
+      `SELECT status, failure_reason, finished_at, started_at, attempts
+         FROM tasks WHERE id=$1`,
+      [fx.taskId],
+    );
+    expect(task.rows[0].status).toBe("pending");
+    expect(task.rows[0].failure_reason).toBe("timeout");
+    expect(task.rows[0].finished_at).toBeNull();
+    expect(task.rows[0].started_at).toBeNull();
+    // attempts is bumped by claimTask, NOT reset on retry — the worker that
+    // re-claims it will bump it again. The reaper-style retry path elsewhere
+    // matches this behaviour.
+    expect(task.rows[0].attempts).toBe(fx.attempts + 1);
+
+    const lease = await db.query<{ released_at: Date | null }>(
+      `SELECT released_at FROM leases WHERE id=$1`,
+      [fx.leaseId],
+    );
+    expect(lease.rows[0].released_at).not.toBeNull();
+
+    const job = await db.query<{ status: string }>(
+      `SELECT status FROM jobs WHERE id=$1`,
+      [fx.jobId],
+    );
+    // claimTask flipped the job to 'running'; failure here is retryable so it
+    // must NOT propagate to 'failed'.
+    expect(job.rows[0].status).not.toBe("failed");
+  });
+
+  it("non-retryable (attempts >= max_attempts): marks task failed, sets finished_at, releases lease, fails the job", async () => {
+    const u = await createUser(`${PREFIX}-fail-final`);
+    const fx = await makeQueuedCpuTaskWithLease(u.id);
+    // Force the task to be on its last legal attempt: max_attempts=1 means
+    // the very first claim already exhausts retries.
+    await db.query(`UPDATE tasks SET max_attempts=1 WHERE id=$1`, [fx.taskId]);
+    const claimed = await claim(fx);
+
+    const ok = await finalizeTaskFailure(claimed, fx.leaseId, "timeout");
+    expect(ok).toBe(true);
+
+    const task = await db.query<{
+      status: string;
+      failure_reason: string | null;
+      finished_at: Date | null;
+    }>(
+      `SELECT status, failure_reason, finished_at FROM tasks WHERE id=$1`,
+      [fx.taskId],
+    );
+    expect(task.rows[0].status).toBe("failed");
+    expect(task.rows[0].failure_reason).toBe("timeout");
+    expect(task.rows[0].finished_at).not.toBeNull();
+
+    const lease = await db.query<{ released_at: Date | null }>(
+      `SELECT released_at FROM leases WHERE id=$1`,
+      [fx.leaseId],
+    );
+    expect(lease.rows[0].released_at).not.toBeNull();
+
+    const job = await db.query<{ status: string }>(
+      `SELECT status FROM jobs WHERE id=$1`,
+      [fx.jobId],
+    );
+    expect(job.rows[0].status).toBe("failed");
+  });
+
+  it("optimistic-lock: returns false and leaves no side effects when attempts changed since claim", async () => {
+    const u = await createUser(`${PREFIX}-fail-stale`);
+    const fx = await makeQueuedCpuTaskWithLease(u.id);
+    const claimed = await claim(fx);
+
+    // Simulate a concurrent reaper bumping attempts behind us.
+    await db.query(`UPDATE tasks SET attempts=attempts+1 WHERE id=$1`, [fx.taskId]);
+
+    const ok = await finalizeTaskFailure(claimed, fx.leaseId, "timeout");
+    expect(ok).toBe(false);
+
+    const task = await db.query<{
+      status: string;
+      failure_reason: string | null;
+    }>(
+      `SELECT status, failure_reason FROM tasks WHERE id=$1`,
+      [fx.taskId],
+    );
+    // The stale-claim path must not flip status nor stamp a reason.
+    expect(task.rows[0].status).not.toBe("failed");
+    expect(task.rows[0].status).not.toBe("pending");
+    expect(task.rows[0].failure_reason).toBeNull();
+
+    const lease = await db.query<{ released_at: Date | null }>(
+      `SELECT released_at FROM leases WHERE id=$1`,
+      [fx.leaseId],
+    );
+    expect(lease.rows[0].released_at).toBeNull();
+  });
+
+  it("does not double-release a lease that was already released", async () => {
+    const u = await createUser(`${PREFIX}-fail-released-lease`);
+    const fx = await makeQueuedCpuTaskWithLease(u.id);
+    const claimed = await claim(fx);
+
+    const before = await db.query<{ released_at: Date }>(
+      `UPDATE leases SET released_at=now() WHERE id=$1 RETURNING released_at`,
+      [fx.leaseId],
+    );
+    const releasedAt = before.rows[0].released_at;
+
+    await finalizeTaskFailure(claimed, fx.leaseId, "timeout");
+
+    const lease = await db.query<{ released_at: Date }>(
+      `SELECT released_at FROM leases WHERE id=$1`,
+      [fx.leaseId],
+    );
+    expect(lease.rows[0].released_at.getTime()).toBe(releasedAt.getTime());
   });
 });
 
