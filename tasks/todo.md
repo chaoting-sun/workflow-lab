@@ -14,6 +14,7 @@ Tick a box only when **acceptance criteria + verification steps** for that task 
 - [x] **T3** — DB client + advisory-lock helper (`lib/db.ts`, `lib/advisory-lock.ts`) — S
 
 ### ✅ Checkpoint A — Foundation
+
 - [ ] `pnpm dev` + `docker compose up -d` + `pnpm db:reset` work on a fresh clone
 - [ ] `pnpm typecheck` green
 - [ ] Human review
@@ -30,20 +31,22 @@ Tick a box only when **acceptance criteria + verification steps** for that task 
 - [x] **T9** — Minimal dashboard (form + job list with progress) — M
 
 ### ✅ Checkpoint B — Happy path
-- [ ] SPEC §9.1 happy path: 1 user, `PIPELINES_PER_JOB=200`, all chaos = 0 → job completes
-- [ ] `pnpm typecheck` green
-- [ ] Human review
+
+- [x] SPEC §9.1 happy path: 1 user, `PIPELINES_PER_JOB=200`, all chaos = 0 → job completes
+- [x] `pnpm typecheck` green
+- [x] Human review
 
 ---
 
 ## Phase 3: Resilience layer
 
-- [ ] **T10** — Lease heartbeat + scheduler reaper + job-failure propagation — M
+- [x] **T10** — Lease heartbeat + scheduler reaper + job-failure propagation — M
 - [ ] **T11** — Per-kind timeouts via `Promise.race` — S
 - [ ] **T12** — Backpressure (CPU paused on SSH backlog) — XS
 - [ ] **T13** — BullMQ `lockDuration` alignment + lock extension + boot-time validation — S
 
 ### ✅ Checkpoint C — Resilience
+
 - [ ] `kill -9` worker mid-flight → job still completes
 - [ ] Forced timeouts → tasks fail cleanly, no wedged worker
 - [ ] Backpressure observed
@@ -58,6 +61,7 @@ Tick a box only when **acceptance criteria + verification steps** for that task 
 - [ ] **T16** — Run SPEC §9.2–9.6, document in `tasks/verification.md` — S
 
 ### ✅ Checkpoint D — Complete
+
 - [ ] All 16 tasks ticked
 - [ ] All 5 SPEC §9 scenarios green and documented
 - [ ] `pnpm typecheck` clean
