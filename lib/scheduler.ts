@@ -79,6 +79,11 @@ async function reserveOneTask(
       [row.task_id, row.user_id, kind, leaseTtlMs],
     );
 
+    // Sole writer of `status='queued'`. The SELECT above filters
+    // `status='pending'`, so this is also the only path producing the
+    // observed `running → queued` outcome — composed with the reaper's
+    // `running → pending` step, both writes leave `attempts` untouched.
+    // See docs/task-lifecycle.md "running → queued puzzle".
     await tx.query(`UPDATE tasks SET status='queued' WHERE id=$1`, [
       row.task_id,
     ]);
@@ -146,6 +151,9 @@ async function dispatchKind(
 // also bumped here, an honest worker that resumes after a brief pause and
 // finalizes (passing the optimistic-lock check) would have its successful
 // finalize counted as one extra attempt against max_attempts.
+// Consequence: a `running → pending → queued` cycle (reap then re-dispatch)
+// preserves `attempts`, which is the diagnostic fingerprint described in
+// docs/task-lifecycle.md "running → queued puzzle".
 //
 // Permanent failure (attempts >= max_attempts) propagates to jobs.status so
 // downstream consumers stop waiting on a barrier that can never fire.
