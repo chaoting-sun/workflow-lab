@@ -106,4 +106,40 @@ describe("parseConfig", () => {
       }),
     ).toThrow(/CPU_SLEEP/);
   });
+
+  // BullMQ's lock would expire mid-task otherwise, causing duplicate delivery.
+  // The 5000ms guard band absorbs scheduler/network jitter between the timeout
+  // and lock expiry.
+  it("rejects BULLMQ_LOCK_DURATION_MS less than max timeout + 5000ms guard", () => {
+    expect(() =>
+      parseConfig({
+        ...baseEnv,
+        TRAINING_TIMEOUT_MS: "60000",
+        BULLMQ_LOCK_DURATION_MS: "64999",
+      }),
+    ).toThrow(/BULLMQ_LOCK_DURATION_MS/);
+  });
+
+  it("accepts BULLMQ_LOCK_DURATION_MS exactly at max timeout + 5000ms boundary", () => {
+    const cfg = parseConfig({
+      ...baseEnv,
+      CPU_TIMEOUT_MS: "15000",
+      SSH_TIMEOUT_MS: "5000",
+      TRAINING_TIMEOUT_MS: "60000",
+      BULLMQ_LOCK_DURATION_MS: "65000",
+    });
+    expect(cfg.BULLMQ_LOCK_DURATION_MS).toBe(65000);
+  });
+
+  it("computes max timeout across all kinds, not just TRAINING", () => {
+    expect(() =>
+      parseConfig({
+        ...baseEnv,
+        CPU_TIMEOUT_MS: "120000",
+        SSH_TIMEOUT_MS: "5000",
+        TRAINING_TIMEOUT_MS: "60000",
+        BULLMQ_LOCK_DURATION_MS: "70000",
+      }),
+    ).toThrow(/BULLMQ_LOCK_DURATION_MS/);
+  });
 });

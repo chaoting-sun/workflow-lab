@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+const BULLMQ_LOCK_GUARD_MS = 5000;
+
 const intMs = z.coerce.number().int().positive();
 const intCount = z.coerce.number().int().nonnegative();
 const rate = z.coerce.number().min(0).max(1);
@@ -42,7 +44,22 @@ const schema = z
   .refine((c) => c.CPU_SLEEP_MIN_MS <= c.CPU_SLEEP_MAX_MS, {
     message: "CPU_SLEEP_MIN_MS must be <= CPU_SLEEP_MAX_MS",
     path: ["CPU_SLEEP_MIN_MS"],
-  });
+  })
+  // BullMQ auto-renews the job lock at lockDuration/2, but if the per-kind
+  // timeout fires *after* the lock expires, BullMQ will redeliver the job to
+  // another worker — duplicating the task. Require a 5s guard band on top of
+  // the longest per-kind timeout to absorb scheduler/network jitter.
+  .refine(
+    (c) =>
+      c.BULLMQ_LOCK_DURATION_MS >=
+      Math.max(c.CPU_TIMEOUT_MS, c.SSH_TIMEOUT_MS, c.TRAINING_TIMEOUT_MS) +
+        BULLMQ_LOCK_GUARD_MS,
+    {
+      message:
+        "BULLMQ_LOCK_DURATION_MS must be >= max(CPU_TIMEOUT_MS, SSH_TIMEOUT_MS, TRAINING_TIMEOUT_MS) + 5000",
+      path: ["BULLMQ_LOCK_DURATION_MS"],
+    },
+  );
 
 export type Config = z.infer<typeof schema>;
 
