@@ -107,9 +107,6 @@ describe("parseConfig", () => {
     ).toThrow(/CPU_SLEEP/);
   });
 
-  // BullMQ's lock would expire mid-task otherwise, causing duplicate delivery.
-  // The 5000ms guard band absorbs scheduler/network jitter between the timeout
-  // and lock expiry.
   it("rejects BULLMQ_LOCK_DURATION_MS less than max timeout + 5000ms guard", () => {
     expect(() =>
       parseConfig({

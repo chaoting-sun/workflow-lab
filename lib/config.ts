@@ -55,8 +55,7 @@ const schema = z
       Math.max(c.CPU_TIMEOUT_MS, c.SSH_TIMEOUT_MS, c.TRAINING_TIMEOUT_MS) +
         BULLMQ_LOCK_GUARD_MS,
     {
-      message:
-        "BULLMQ_LOCK_DURATION_MS must be >= max(CPU_TIMEOUT_MS, SSH_TIMEOUT_MS, TRAINING_TIMEOUT_MS) + 5000",
+      message: `BULLMQ_LOCK_DURATION_MS must be >= max(CPU_TIMEOUT_MS, SSH_TIMEOUT_MS, TRAINING_TIMEOUT_MS) + ${BULLMQ_LOCK_GUARD_MS}`,
       path: ["BULLMQ_LOCK_DURATION_MS"],
     },
   );
