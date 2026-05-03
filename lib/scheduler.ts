@@ -1,5 +1,7 @@
 import { db } from "./db";
 import { getConfig } from "./config";
+import { failJob } from "./jobs";
+import { releaseLease } from "./worker";
 
 export interface DispatchMessage {
   taskId: string;
@@ -125,6 +127,64 @@ async function dispatchKind(
   return dispatched;
 }
 
+// Death-detection: a lease whose `expires_at` slipped past now() without
+// `released_at` being set means the worker stopped heartbeating (process
+// crash, hang, GC stall past the TTL). The reaper runs once per scheduler
+// tick, BEFORE dispatch, so freed slots are visible to fairness counting in
+// the same tick.
+//
+// `attempts` is NOT incremented here — the next claimTask bumps it. If we
+// also bumped here, an honest worker that resumes after a brief pause and
+// finalizes (passing the optimistic-lock check) would have its successful
+// finalize counted as one extra attempt against max_attempts.
+//
+// Permanent failure (attempts >= max_attempts) propagates to jobs.status so
+// downstream consumers stop waiting on a barrier that can never fire.
+export async function reapExpiredLeases(): Promise<number> {
+  return db.tx(async (tx) => {
+    const expired = await tx.query<{
+      lease_id: string;
+      task_id: string;
+      job_id: string;
+      attempts: number;
+      max_attempts: number;
+    }>(
+      `SELECT l.id AS lease_id, l.task_id, t.job_id,
+              t.attempts, t.max_attempts
+         FROM leases l
+         JOIN tasks t ON t.id = l.task_id
+        WHERE l.released_at IS NULL
+          AND l.expires_at < now()
+        FOR UPDATE OF l SKIP LOCKED`,
+    );
+
+    for (const row of expired.rows) {
+      const retryable = row.attempts < row.max_attempts;
+      if (retryable) {
+        await tx.query(
+          `UPDATE tasks
+              SET status='pending', started_at=NULL
+            WHERE id=$1 AND status IN ('queued','running')`,
+          [row.task_id],
+        );
+      } else {
+        await tx.query(
+          `UPDATE tasks
+              SET status='failed',
+                  failure_reason='lease_expired',
+                  finished_at=now()
+            WHERE id=$1 AND status NOT IN ('succeeded','failed')`,
+          [row.task_id],
+        );
+        await failJob(tx, row.job_id);
+      }
+      await releaseLease(tx, row.lease_id);
+    }
+
+    return expired.rowCount ?? 0;
+  });
+}
+
 export async function dispatchCpu(queue: DispatchQueue): Promise<number> {
   return dispatchKind(queue, "cpu", getConfig().GLOBAL_CPU_SLOTS);
 }
@@ -164,12 +224,14 @@ export function runSchedulerLoop(
     timer = setTimeout(loop, opts.intervalMs);
   };
 
-  // CPU, SSH and training dispatch touch disjoint leases.resource values and
-  // disjoint tasks.kind rows, so they share no row-level locks and can run in
-  // parallel within a single scheduler instance.
+  // Reap first so freed slots are counted in this tick's dispatch. CPU, SSH
+  // and training dispatch touch disjoint leases.resource values and disjoint
+  // tasks.kind rows, so they share no row-level locks and can run in parallel
+  // within a single scheduler instance.
   const loop = (): void => {
     inFlight = (async () => {
       try {
+        await reapExpiredLeases();
         const work: Promise<unknown>[] = [dispatchCpu(opts.queues.cpu)];
         if (opts.queues.ssh) work.push(dispatchSsh(opts.queues.ssh));
         if (opts.queues.training)

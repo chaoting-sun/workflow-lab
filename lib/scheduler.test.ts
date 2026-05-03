@@ -7,6 +7,7 @@ import {
   dispatchCpu,
   dispatchSsh,
   dispatchTraining,
+  reapExpiredLeases,
   type DispatchMessage,
   type DispatchQueue,
 } from "./scheduler";
@@ -363,5 +364,163 @@ describe("dispatchTraining", () => {
     const queue = new FakeQueue();
     const n = await dispatchTraining(queue);
     expect(n).toBe(1);
+  });
+});
+
+// Forge a queued CPU task with an expired (or about-to-expire) lease, simulating
+// a worker that died mid-flight without releasing.
+async function makeQueuedCpuWithExpiredLease(
+  userId: string,
+  opts: { attempts?: number; maxAttempts?: number } = {},
+): Promise<{ jobId: string; taskId: string; leaseId: string }> {
+  const job = await createJob({ userId, pipelinesCount: 1 });
+  const t = await db.query<{ id: string }>(
+    `SELECT id FROM tasks WHERE job_id=$1 LIMIT 1`,
+    [job.jobId],
+  );
+  const taskId = t.rows[0].id;
+  await db.query(
+    `UPDATE tasks
+        SET status='queued', attempts=$2, max_attempts=$3
+      WHERE id=$1`,
+    [taskId, opts.attempts ?? 0, opts.maxAttempts ?? 3],
+  );
+  const lease = await db.query<{ id: string }>(
+    `INSERT INTO leases (task_id, user_id, resource, expires_at)
+       VALUES ($1, $2, 'cpu', now() - interval '1 second')
+       RETURNING id`,
+    [taskId, userId],
+  );
+  return { jobId: job.jobId, taskId, leaseId: lease.rows[0].id };
+}
+
+describe("reapExpiredLeases", () => {
+  it("returns 0 and does nothing when no leases are expired", async () => {
+    const u = await createUser(`${PREFIX}-reap-noop`);
+    const job = await createJob({ userId: u.id, pipelinesCount: 1 });
+    const t = await db.query<{ id: string }>(
+      `SELECT id FROM tasks WHERE job_id=$1 LIMIT 1`,
+      [job.jobId],
+    );
+    await db.query(`UPDATE tasks SET status='queued' WHERE id=$1`, [t.rows[0].id]);
+    await db.query(
+      `INSERT INTO leases (task_id, user_id, resource, expires_at)
+         VALUES ($1, $2, 'cpu', now() + interval '1 minute')`,
+      [t.rows[0].id, u.id],
+    );
+
+    expect(await reapExpiredLeases()).toBe(0);
+
+    const row = await db.query<{ status: string }>(
+      `SELECT status FROM tasks WHERE id=$1`,
+      [t.rows[0].id],
+    );
+    expect(row.rows[0].status).toBe("queued");
+  });
+
+  it("resets a retryable expired task to 'pending' and releases the lease", async () => {
+    const u = await createUser(`${PREFIX}-reap-retry`);
+    const fx = await makeQueuedCpuWithExpiredLease(u.id, {
+      attempts: 1,
+      maxAttempts: 3,
+    });
+
+    const reaped = await reapExpiredLeases();
+    expect(reaped).toBe(1);
+
+    const task = await db.query<{
+      status: string;
+      attempts: number;
+      started_at: Date | null;
+    }>(`SELECT status, attempts, started_at FROM tasks WHERE id=$1`, [
+      fx.taskId,
+    ]);
+    expect(task.rows[0].status).toBe("pending");
+    // attempts is NOT bumped by the reaper — the next worker's claimTask bumps
+    // it. Bumping here would double-count attempts.
+    expect(task.rows[0].attempts).toBe(1);
+    expect(task.rows[0].started_at).toBeNull();
+
+    const lease = await db.query<{ released_at: Date | null }>(
+      `SELECT released_at FROM leases WHERE id=$1`,
+      [fx.leaseId],
+    );
+    expect(lease.rows[0].released_at).not.toBeNull();
+  });
+
+  it("marks a task 'failed' when attempts >= max_attempts and propagates job failure", async () => {
+    const u = await createUser(`${PREFIX}-reap-perm-fail`);
+    const fx = await makeQueuedCpuWithExpiredLease(u.id, {
+      attempts: 3,
+      maxAttempts: 3,
+    });
+
+    expect(await reapExpiredLeases()).toBe(1);
+
+    const task = await db.query<{
+      status: string;
+      failure_reason: string | null;
+      finished_at: Date | null;
+    }>(
+      `SELECT status, failure_reason, finished_at FROM tasks WHERE id=$1`,
+      [fx.taskId],
+    );
+    expect(task.rows[0].status).toBe("failed");
+    expect(task.rows[0].failure_reason).toBe("lease_expired");
+    expect(task.rows[0].finished_at).not.toBeNull();
+
+    const job = await db.query<{ status: string; completed_at: Date | null }>(
+      `SELECT status, completed_at FROM jobs WHERE id=$1`,
+      [fx.jobId],
+    );
+    expect(job.rows[0].status).toBe("failed");
+    expect(job.rows[0].completed_at).not.toBeNull();
+
+    const lease = await db.query<{ released_at: Date | null }>(
+      `SELECT released_at FROM leases WHERE id=$1`,
+      [fx.leaseId],
+    );
+    expect(lease.rows[0].released_at).not.toBeNull();
+  });
+
+  it("does not touch leases that are already released", async () => {
+    const u = await createUser(`${PREFIX}-reap-released`);
+    const fx = await makeQueuedCpuWithExpiredLease(u.id);
+    await db.query(`UPDATE leases SET released_at=now() WHERE id=$1`, [
+      fx.leaseId,
+    ]);
+    // Task is left in 'queued' on purpose; reaper must not touch it.
+    expect(await reapExpiredLeases()).toBe(0);
+
+    const task = await db.query<{ status: string }>(
+      `SELECT status FROM tasks WHERE id=$1`,
+      [fx.taskId],
+    );
+    expect(task.rows[0].status).toBe("queued");
+  });
+
+  it("frees CPU slots — after reap, dispatchCpu can use the freed slot", async () => {
+    // Saturate CPU pool with 20 expired leases on permanently-failed tasks.
+    // attempts==max_attempts ensures the reaper marks them 'failed' (not
+    // 'pending'), so the dispatch count below tests slot recovery cleanly.
+    const filler = await createUser(`${PREFIX}-reap-slot`);
+    for (let i = 0; i < 20; i++) {
+      await makeQueuedCpuWithExpiredLease(filler.id, {
+        attempts: 3,
+        maxAttempts: 3,
+      });
+    }
+
+    const u = await createUser(`${PREFIX}-reap-slot-user`);
+    await createJob({ userId: u.id, pipelinesCount: 1 });
+
+    // Before reap: no free slots.
+    const queueBefore = new FakeQueue();
+    expect(await dispatchCpu(queueBefore)).toBe(0);
+
+    await reapExpiredLeases();
+
+    const queueAfter = new FakeQueue();
+    expect(await dispatchCpu(queueAfter)).toBe(1);
   });
 });
