@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import { apiFetch } from "@/lib/api-client";
 import type { JobView, ProgressCounts, User } from "@/lib/types";
 
-const POLL_MS = 1000;
+const POLL_MS = 3000;
 
 interface Props {
   users: User[];
@@ -125,7 +125,11 @@ function JobRow({
   );
 }
 
-function StatusBadge({ status }: { status: JobView["status"] }): React.ReactElement {
+function StatusBadge({
+  status,
+}: {
+  status: JobView["status"];
+}): React.ReactElement {
   const palette: Record<JobView["status"], string> = {
     pending: "bg-neutral-100 text-neutral-700",
     running: "bg-blue-100 text-blue-700",
