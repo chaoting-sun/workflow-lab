@@ -10,7 +10,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "worker": "tsx --env-file=.env worker/index.ts",
-    "db:reset": "psql \"$DATABASE_URL\" -f db/schema.sql"
+    "db:reset": "docker compose exec -T postgres psql -U workflow -d workflow_lab -f /docker-entrypoint-initdb.d/01-schema.sql"
   },
   "dependencies": {
     "next": "^15.1.0",
