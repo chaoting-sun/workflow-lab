@@ -5,6 +5,7 @@ import {
   claimTask,
   finalizeTrainingSuccess,
   StaleAttemptError,
+  startHeartbeat,
   type WorkerTaskMessage,
 } from "../lib/worker";
 
@@ -31,11 +32,14 @@ export async function runTrainingTask(
   const claimed = await claimTask(msg);
   if (!claimed) return;
 
+  const heartbeat = startHeartbeat(msg.leaseId);
   try {
     await doWork(claimed.jobId);
     await finalizeTrainingSuccess(claimed, msg.leaseId);
   } catch (err) {
     if (err instanceof StaleAttemptError) return;
     throw err;
+  } finally {
+    heartbeat.stop();
   }
 }

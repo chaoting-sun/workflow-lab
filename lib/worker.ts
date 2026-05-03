@@ -11,6 +11,63 @@ export async function releaseLease(
   ]);
 }
 
+export interface HeartbeatHandle {
+  stop(): void;
+}
+
+export interface HeartbeatOptions {
+  intervalMs?: number;
+  ttlMs?: number;
+}
+
+// The reaper treats `expires_at < now() AND released_at IS NULL` as "worker
+// is dead", so a live worker must keep pushing expires_at forward. The
+// `released_at IS NULL` guard means we never resurrect a lease that the
+// finalize tx has released — the SQL is a no-op once released.
+export function startHeartbeat(
+  leaseId: string,
+  opts: HeartbeatOptions = {},
+): HeartbeatHandle {
+  const cfg = getConfig();
+  const intervalMs = opts.intervalMs ?? cfg.LEASE_HEARTBEAT_MS;
+  const ttlMs = opts.ttlMs ?? cfg.LEASE_TTL_MS;
+
+  let stopped = false;
+  const tick = async (): Promise<void> => {
+    if (stopped) return;
+    try {
+      await db.query(
+        `UPDATE leases
+            SET heartbeat_at=now(),
+                expires_at=now() + ($2::bigint * interval '1 millisecond')
+          WHERE id=$1 AND released_at IS NULL`,
+        [leaseId, ttlMs],
+      );
+    } catch (err) {
+      // Heartbeat failure must never crash the worker process. Log and
+      // continue — the next tick will retry. If the DB is durably broken
+      // the lease will eventually expire and the reaper will pick it up.
+      console.error(`heartbeat for lease ${leaseId} failed:`, err);
+    }
+  };
+
+  // Chain ticks instead of firing them concurrently. If a tick stalls past
+  // intervalMs (DB blip), naive setInterval would pile up parallel UPDATEs
+  // and exhaust the pool; the chain serialises them so a stall costs at
+  // most one in-flight query.
+  let chain: Promise<void> = Promise.resolve();
+  const timer = setInterval(() => {
+    chain = chain.then(tick);
+  }, intervalMs);
+
+  return {
+    stop(): void {
+      stopped = true;
+      clearInterval(timer);
+    },
+  };
+}
+
 export interface WorkerTaskMessage {
   taskId: string;
   leaseId: string;

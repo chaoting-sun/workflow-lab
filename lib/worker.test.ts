@@ -10,6 +10,7 @@ import {
   claimTask,
   finalizeCpuSuccess,
   StaleAttemptError,
+  startHeartbeat,
   type ClaimedTask,
   type WorkerTaskMessage,
 } from "./worker";
@@ -285,5 +286,72 @@ describe("finalizeCpuSuccess", () => {
       [fx.taskId],
     );
     expect(child.rows[0].count).toBe("1");
+  });
+});
+
+describe("startHeartbeat", () => {
+  async function getLeaseTimes(leaseId: string): Promise<{
+    heartbeat_at: Date;
+    expires_at: Date;
+    released_at: Date | null;
+  }> {
+    const { rows } = await db.query<{
+      heartbeat_at: Date;
+      expires_at: Date;
+      released_at: Date | null;
+    }>(
+      `SELECT heartbeat_at, expires_at, released_at FROM leases WHERE id=$1`,
+      [leaseId],
+    );
+    return rows[0];
+  }
+
+  it("bumps heartbeat_at and expires_at on each tick while running", async () => {
+    const u = await createUser(`${PREFIX}-hb-bump`);
+    const fx = await makeQueuedCpuTaskWithLease(u.id);
+    const before = await getLeaseTimes(fx.leaseId);
+
+    const hb = startHeartbeat(fx.leaseId, { intervalMs: 30, ttlMs: 60_000 });
+    await new Promise((r) => setTimeout(r, 120));
+    hb.stop();
+
+    const after = await getLeaseTimes(fx.leaseId);
+    expect(after.heartbeat_at.getTime()).toBeGreaterThan(
+      before.heartbeat_at.getTime(),
+    );
+    expect(after.expires_at.getTime()).toBeGreaterThan(
+      before.expires_at.getTime(),
+    );
+  });
+
+  it("stops bumping after stop()", async () => {
+    const u = await createUser(`${PREFIX}-hb-stop`);
+    const fx = await makeQueuedCpuTaskWithLease(u.id);
+
+    const hb = startHeartbeat(fx.leaseId, { intervalMs: 30, ttlMs: 60_000 });
+    await new Promise((r) => setTimeout(r, 80));
+    hb.stop();
+    const afterStop = await getLeaseTimes(fx.leaseId);
+
+    await new Promise((r) => setTimeout(r, 120));
+    const later = await getLeaseTimes(fx.leaseId);
+
+    expect(later.heartbeat_at.getTime()).toBe(afterStop.heartbeat_at.getTime());
+    expect(later.expires_at.getTime()).toBe(afterStop.expires_at.getTime());
+  });
+
+  it("does not resurrect a released lease", async () => {
+    const u = await createUser(`${PREFIX}-hb-released`);
+    const fx = await makeQueuedCpuTaskWithLease(u.id);
+    await db.query(`UPDATE leases SET released_at=now() WHERE id=$1`, [
+      fx.leaseId,
+    ]);
+
+    const hb = startHeartbeat(fx.leaseId, { intervalMs: 20, ttlMs: 60_000 });
+    await new Promise((r) => setTimeout(r, 80));
+    hb.stop();
+
+    const row = await getLeaseTimes(fx.leaseId);
+    expect(row.released_at).not.toBeNull();
   });
 });

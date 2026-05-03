@@ -6,6 +6,7 @@ import {
   claimTask,
   finalizeSshSuccess,
   StaleAttemptError,
+  startHeartbeat,
   type WorkerTaskMessage,
 } from "../lib/worker";
 
@@ -29,6 +30,7 @@ export async function runSshTask(
   const claimed = await claimTask(msg);
   if (!claimed) return;
 
+  const heartbeat = startHeartbeat(msg.leaseId);
   try {
     const artifactPath = await doWork(claimed.taskId);
     await access(artifactPath);
@@ -36,5 +38,7 @@ export async function runSshTask(
   } catch (err) {
     if (err instanceof StaleAttemptError) return;
     throw err;
+  } finally {
+    heartbeat.stop();
   }
 }
