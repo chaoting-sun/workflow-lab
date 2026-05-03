@@ -15,9 +15,9 @@ Tick a box only when **acceptance criteria + verification steps** for that task 
 
 ### ✅ Checkpoint A — Foundation
 
-- [ ] `pnpm dev` + `docker compose up -d` + `pnpm db:reset` work on a fresh clone
-- [ ] `pnpm typecheck` green
-- [ ] Human review
+- [x] `pnpm dev` + `docker compose up -d` + `pnpm db:reset` work on a fresh clone
+- [x] `pnpm typecheck` green
+- [x] Human review
 
 ---
 
