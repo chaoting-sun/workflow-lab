@@ -139,4 +139,58 @@ describe("parseConfig", () => {
       }),
     ).toThrow(/BULLMQ_LOCK_DURATION_MS/);
   });
+
+  it("applies documented default concurrency when *_WORKER_CONCURRENCY unset", () => {
+    const {
+      CPU_WORKER_CONCURRENCY: _c,
+      SSH_WORKER_CONCURRENCY: _s,
+      TRAINING_WORKER_CONCURRENCY: _t,
+      ...env
+    } = {
+      ...baseEnv,
+      CPU_WORKER_CONCURRENCY: "irrelevant",
+      SSH_WORKER_CONCURRENCY: "irrelevant",
+      TRAINING_WORKER_CONCURRENCY: "irrelevant",
+    };
+    const cfg = parseConfig(env);
+    expect(cfg.CPU_WORKER_CONCURRENCY).toBe(20);
+    expect(cfg.SSH_WORKER_CONCURRENCY).toBe(40);
+    expect(cfg.TRAINING_WORKER_CONCURRENCY).toBe(4);
+  });
+
+  it("coerces explicit *_WORKER_CONCURRENCY values", () => {
+    const cfg = parseConfig({
+      ...baseEnv,
+      CPU_WORKER_CONCURRENCY: "4",
+      SSH_WORKER_CONCURRENCY: "8",
+      TRAINING_WORKER_CONCURRENCY: "2",
+    });
+    expect(cfg.CPU_WORKER_CONCURRENCY).toBe(4);
+    expect(cfg.SSH_WORKER_CONCURRENCY).toBe(8);
+    expect(cfg.TRAINING_WORKER_CONCURRENCY).toBe(2);
+  });
+
+  it("rejects *_WORKER_CONCURRENCY = 0", () => {
+    expect(() =>
+      parseConfig({ ...baseEnv, CPU_WORKER_CONCURRENCY: "0" }),
+    ).toThrow(/CPU_WORKER_CONCURRENCY/);
+    expect(() =>
+      parseConfig({ ...baseEnv, SSH_WORKER_CONCURRENCY: "0" }),
+    ).toThrow(/SSH_WORKER_CONCURRENCY/);
+    expect(() =>
+      parseConfig({ ...baseEnv, TRAINING_WORKER_CONCURRENCY: "0" }),
+    ).toThrow(/TRAINING_WORKER_CONCURRENCY/);
+  });
+
+  it("rejects non-numeric *_WORKER_CONCURRENCY", () => {
+    expect(() =>
+      parseConfig({ ...baseEnv, CPU_WORKER_CONCURRENCY: "many" }),
+    ).toThrow(/CPU_WORKER_CONCURRENCY/);
+  });
+
+  it("rejects fractional *_WORKER_CONCURRENCY", () => {
+    expect(() =>
+      parseConfig({ ...baseEnv, SSH_WORKER_CONCURRENCY: "2.5" }),
+    ).toThrow(/SSH_WORKER_CONCURRENCY/);
+  });
 });
