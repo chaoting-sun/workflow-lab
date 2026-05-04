@@ -1,6 +1,7 @@
 import { access } from "node:fs/promises";
 import { getConfig } from "../lib/config";
 import { sshArtifactPath, writeArtifactFile } from "../lib/artifacts";
+import { maybeOversleep, maybeSkipArtifact } from "../lib/chaos";
 import { sleep } from "../lib/sleep";
 import { withTimeout } from "../lib/timeout";
 import {
@@ -19,11 +20,22 @@ export interface RunSshOptions {
   timeoutMs?: number;
 }
 
+// Buffer past SSH_TIMEOUT_MS used by the oversleep chaos hook to make sure
+// withTimeout actually fires in the face of scheduler / setTimeout jitter.
+const CHAOS_OVERSLEEP_BUFFER_MS = 1000;
+
 export async function defaultSshWork(taskId: string): Promise<string> {
   const cfg = getConfig();
-  await sleep(cfg.SSH_SLEEP_MS);
+  const willOversleep = maybeOversleep(cfg.CHAOS_SSH_TIMEOUT_RATE);
+  const willSkipArtifact = maybeSkipArtifact(cfg.CHAOS_SSH_MISSING_ARTIFACT_RATE);
+  const sleepMs = willOversleep
+    ? cfg.SSH_TIMEOUT_MS + CHAOS_OVERSLEEP_BUFFER_MS
+    : cfg.SSH_SLEEP_MS;
+  await sleep(sleepMs);
   const path = sshArtifactPath(taskId);
-  await writeArtifactFile(path, `ssh task ${taskId}\n`);
+  if (!willSkipArtifact) {
+    await writeArtifactFile(path, `ssh task ${taskId}\n`);
+  }
   return path;
 }
 

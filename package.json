@@ -10,6 +10,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "worker": "tsx --env-file=.env worker/index.ts",
+    "worker:watch": "trap 'exit 0' INT TERM; until tsx --env-file=.env worker/index.ts; do echo '[worker:watch] worker exited non-zero, restarting in 1s'; sleep 1; done",
     "db:reset": "docker compose exec -T postgres psql -U workflow -d workflow_lab -f /docker-entrypoint-initdb.d/01-schema.sql"
   },
   "dependencies": {

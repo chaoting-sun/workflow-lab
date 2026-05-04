@@ -1,6 +1,7 @@
 import { access } from "node:fs/promises";
 import { getConfig } from "../lib/config";
 import { cpuArtifactPath, writeArtifactFile } from "../lib/artifacts";
+import { maybeCrash } from "../lib/chaos";
 import { sleep } from "../lib/sleep";
 import { withTimeout } from "../lib/timeout";
 import {
@@ -23,9 +24,16 @@ export interface RunCpuOptions {
   timeoutMs?: number;
 }
 
+// Crash mid-sleep (not at the boundaries) so the lease is held, the task is
+// `running`, and the heartbeat is mid-renewal when the process dies — that's
+// the failure mode the reaper exists to catch.
 export async function defaultCpuWork(taskId: string): Promise<string> {
   const cfg = getConfig();
-  await sleep(randomBetween(cfg.CPU_SLEEP_MIN_MS, cfg.CPU_SLEEP_MAX_MS));
+  const total = randomBetween(cfg.CPU_SLEEP_MIN_MS, cfg.CPU_SLEEP_MAX_MS);
+  const firstHalf = Math.floor(total / 2);
+  await sleep(firstHalf);
+  maybeCrash(cfg.CHAOS_CPU_CRASH_RATE);
+  await sleep(total - firstHalf);
   const path = cpuArtifactPath(taskId);
   await writeArtifactFile(path, `cpu task ${taskId}\n`);
   return path;
