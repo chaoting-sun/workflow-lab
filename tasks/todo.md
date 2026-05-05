@@ -5,12 +5,14 @@ Spec: `SPEC.md`.
 
 Tick a box only when **acceptance criteria + verification steps** for that task pass.
 
+> **Active change:** ADR-0001 — drop `leases` table; lease state moves onto `tasks`. See `tasks/replan-log.md`.
+
 ---
 
 ## Phase 1: Foundation
 
 - [x] **T1** — Project scaffold (Next.js + TS strict + Tailwind + pnpm + docker-compose + zod env config) — M
-- [x] **T2** — DB schema (`db/schema.sql`, all tables/indexes/unique constraints from SPEC §3.4) — S
+- [x] **T2** — DB schema (`db/schema.sql`, all tables/indexes/unique constraints from SPEC §3.4) — S — needs reverification (ADR-0001)
 - [x] **T3** — DB client + advisory-lock helper (`lib/db.ts`, `lib/advisory-lock.ts`) — S
 
 ### ✅ Checkpoint A — Foundation
@@ -24,10 +26,10 @@ Tick a box only when **acceptance criteria + verification steps** for that task 
 ## Phase 2: Happy-path vertical slice
 
 - [x] **T4** — Users & jobs API (POST/GET, zod validation, `pipelines_count` snapshot) — M
-- [x] **T5** — Scheduler tick (CPU only) with single-instance advisory lock — M
-- [x] **T6** — CPU worker with atomic-claim + optimistic-lock — M
-- [x] **T7** — SSH worker + barrier check (counts `artifacts` table) — M
-- [x] **T8** — Training worker + job completion — S
+- [x] **T5** — Scheduler tick (CPU only) with single-instance advisory lock — M — needs reverification (ADR-0001)
+- [x] **T6** — CPU worker with atomic-claim + optimistic-lock — M — needs reverification (ADR-0001)
+- [x] **T7** — SSH worker + barrier check (counts `artifacts` table) — M — needs reverification (ADR-0001)
+- [x] **T8** — Training worker + job completion — S — needs reverification (ADR-0001)
 - [x] **T9** — Minimal dashboard (form + job list with progress) — M
 
 ### ✅ Checkpoint B — Happy path
@@ -40,7 +42,7 @@ Tick a box only when **acceptance criteria + verification steps** for that task 
 
 ## Phase 3: Resilience layer
 
-- [x] **T10** — Lease heartbeat + scheduler reaper + job-failure propagation — M
+- [x] **T10** — Lease heartbeat + scheduler reaper + job-failure propagation — M — needs reverification (ADR-0001)
 - [x] **T11** — Per-kind timeouts via `Promise.race` — S
 - [x] **T12** — Backpressure (CPU paused on SSH backlog) — XS
 - [x] **T13** — BullMQ `lockDuration` alignment + lock extension + boot-time validation — S
@@ -58,7 +60,7 @@ Tick a box only when **acceptance criteria + verification steps** for that task 
 ## Phase 4: Chaos & multi-user verification
 
 - [x] **T14** — Chaos knobs (`CHAOS_CPU_CRASH_RATE`, `CHAOS_SSH_TIMEOUT_RATE`, `CHAOS_SSH_MISSING_ARTIFACT_RATE`) + `pnpm worker:watch` — S
-- [ ] **T15** — Fairness panel in dashboard (per-user running counts) — S
+- [ ] **T15** — Fairness panel in dashboard (per-user running counts) — S — amended by ADR-0001 (build after T22)
 - [ ] **T16** — Run SPEC §9.2–9.6, document in `tasks/verification.md` — S
 
 ### ✅ Checkpoint D — Complete
@@ -67,6 +69,21 @@ Tick a box only when **acceptance criteria + verification steps** for that task 
 - [ ] All 5 SPEC §9 scenarios green and documented
 - [ ] `pnpm typecheck` clean
 - [ ] Final review
+
+---
+
+## Phase 4.5: Lease consolidation (ADR-0001)
+
+- [x] **T22** — Lease-into-tasks migration + helper rename (drop `leases`, add `tasks.lease_*`, rename `leaseId`→`leaseToken`, update all tests) — L
+- [ ] **T23** — Race test: `lease_token` fencing under reap-and-redispatch — S
+
+### ✅ Checkpoint D.1 — Lease consolidation verified
+
+- [ ] T22 + T23 complete
+- [ ] All previously-passing tests green under the new schema
+- [ ] Checkpoint B happy path re-verified
+- [ ] Checkpoint C `kill -9` resilience re-verified
+- [ ] Human review before resuming T15 / T16
 
 ---
 

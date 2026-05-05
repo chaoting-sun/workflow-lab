@@ -69,20 +69,22 @@ Phase 4: Chaos & multi-user
 
 #### Task 2: Database schema
 
+> Amended by ADR-0001 (2026-05-04): `leases` table is being removed; lease state moves onto `tasks` via `lease_token`, `lease_expires_at`, `lease_heartbeat_at`. T22 lands the actual migration; this entry is updated so future re-verification matches the new shape.
+
 **Description:** Author `db/schema.sql` containing every table, index, and unique constraint listed in SPEC §3.4 — including `UNIQUE (parent_task_id) WHERE kind='ssh'`, `UNIQUE (task_id)` on artifacts, and the `jobs.pipelines_count` column. Provide a one-shot apply script.
 
 **Acceptance criteria:**
-- [ ] Tables exist: `users`, `jobs`, `tasks`, `artifacts`, `leases`.
+- [ ] Tables exist: `users`, `jobs`, `tasks`, `artifacts`. (`leases` removed per ADR-0001.)
 - [ ] `tasks` has `attempts`, `max_attempts`, `failure_reason`, `parent_task_id`.
+- [ ] `tasks` has `lease_token uuid`, `lease_expires_at timestamptz`, `lease_heartbeat_at timestamptz` (all nullable; NULL = no active lease).
 - [ ] `jobs.pipelines_count` exists, NOT NULL, with a CHECK 1..1000.
 - [ ] Partial unique index on `tasks(parent_task_id) WHERE kind='ssh'`.
 - [ ] `UNIQUE (task_id)` on `artifacts`.
-- [ ] `leases` has `acquired_at`, `heartbeat_at`, `expires_at`, `released_at`.
-- [ ] Indexes for hot queries: `tasks (kind, status, user_id)`, `leases (resource, released_at)`, `artifacts (task_id)`.
+- [ ] Indexes for hot queries: `tasks (kind, status, user_id)`, `artifacts (task_id)`, partial `tasks (lease_expires_at) WHERE lease_expires_at IS NOT NULL` (for the reaper).
 
 **Verification:**
 - [ ] `psql -f db/schema.sql` against a fresh DB succeeds and is idempotent (DROP TABLE IF EXISTS… or guarded CREATEs).
-- [ ] `\d+ tasks` shows the partial unique index.
+- [ ] `\d+ tasks` shows the partial unique index AND the new partial lease-expiry index.
 - [ ] Manual insert of two SSH tasks with the same `parent_task_id` fails with the expected unique-violation.
 
 **Dependencies:** Task 1 (docker-compose for Postgres)
@@ -163,14 +165,16 @@ Goal: one user submits one job, all N pipelines run to completion, training arti
 
 #### Task 5: Scheduler tick (CPU only) with single-instance lock
 
-**Description:** Build the scheduler loop in `lib/scheduler.ts`: acquire advisory lock; tick every `SCHEDULER_TICK_MS`; for CPU only, run the fairness SQL from SPEC §3.3, create a lease, mark the task `queued`, enqueue `{taskId, leaseId, attempts}` to BullMQ. Reaper, backpressure, SSH, and training scheduling are stubs (no-ops) at this stage. Wire it into `worker/index.ts` so `pnpm worker` boots scheduler + an empty BullMQ worker shell.
+> Amended by ADR-0001 (2026-05-04): no separate `leases` row to INSERT — reserve becomes a single UPDATE on `tasks` setting `status='queued', lease_token=$new_uuid, lease_expires_at=now()+TTL, lease_heartbeat_at=now()`. Slot accounting and fairness subqueries count `tasks` rows where `lease_token IS NOT NULL`. BullMQ payload is `{taskId, leaseToken, attempts}`. Re-verify under T22.
+
+**Description:** Build the scheduler loop in `lib/scheduler.ts`: acquire advisory lock; tick every `SCHEDULER_TICK_MS`; for CPU only, run the fairness SQL from SPEC §3.3 (adapted per ADR-0001 to read from `tasks.lease_*`), set the task to `queued` with a fresh `lease_token` and `lease_expires_at = now() + LEASE_TTL_MS`, enqueue `{taskId, leaseToken, attempts}` to BullMQ. Reaper, backpressure, SSH, and training scheduling are stubs (no-ops) at this stage. Wire it into `worker/index.ts` so `pnpm worker` boots scheduler + an empty BullMQ worker shell.
 
 **Acceptance criteria:**
 - [ ] On startup, refuses to run a second instance (advisory lock).
-- [ ] Each tick, picks **at most** `GLOBAL_CPU_SLOTS - used` CPU tasks across all users.
-- [ ] Fairness SQL orders by `(running_cpu_count ASC, jobs.created_at ASC, tasks.created_at ASC)`.
-- [ ] Lease row is committed before BullMQ `add`; if `add` throws, the lease will be reaped later (no special handling required here).
-- [ ] No CPU task is dispatched twice (verify via `SELECT count(*) FROM leases WHERE task_id=… AND released_at IS NULL` always ≤ 1 per task).
+- [ ] Each tick, picks **at most** `GLOBAL_CPU_SLOTS - used` CPU tasks across all users, where `used = count(*) FROM tasks WHERE kind='cpu' AND lease_token IS NOT NULL AND lease_expires_at > now()`.
+- [ ] Fairness SQL orders by `(running_cpu_count ASC, jobs.created_at ASC, tasks.created_at ASC)`, where `running_cpu_count` counts `tasks` self-joined on `user_id` with `lease_token IS NOT NULL`.
+- [ ] Reserve UPDATE commits before BullMQ `add`; if `add` throws, the lease columns will be reaped later (no special handling required here).
+- [ ] No CPU task is dispatched twice (verify: at most one row per task has `lease_token IS NOT NULL` at any moment).
 
 **Verification:**
 - [ ] Submit 1 job with `PIPELINES_PER_JOB=5`, `GLOBAL_CPU_SLOTS=2`. Watch `tasks.status` transitions: 5 pending → 2 queued → others stay pending until reaper would re-dispatch (but reaper is stub, so no recovery yet). Status changes from `pending` to `queued` for at most 2 at a time. (Note: with no worker handler yet, queued tasks pile in BullMQ — expected.)
@@ -189,12 +193,14 @@ Goal: one user submits one job, all N pipelines run to completion, training arti
 
 #### Task 6: CPU worker (with atomic-claim + optimistic-lock)
 
-**Description:** Implement `worker/cpu.ts` per SPEC §3.7. Atomic claim on receive; sleep `CPU_SLEEP_MIN_MS..CPU_SLEEP_MAX_MS`; write `artifacts/cpu-${taskId}.txt`; in one transaction with optimistic-lock, set task succeeded, insert `artifacts` row, release lease, INSERT child SSH task with `ON CONFLICT (parent_task_id) DO NOTHING`. Helpers (`runWorkerHandler`, claim/release SQL) extracted to `lib/worker.ts` for reuse.
+> Amended by ADR-0001 (2026-05-04): claim gates on `lease_token = $messageToken` (replacing the `EXISTS (SELECT 1 FROM leases ...)` subquery); release sets `lease_token = NULL, lease_expires_at = NULL` on the same UPDATE that flips status. BullMQ payload field renamed to `leaseToken`. Re-verify under T22.
+
+**Description:** Implement `worker/cpu.ts` per SPEC §3.7 (adapted per ADR-0001). Atomic claim on receive; sleep `CPU_SLEEP_MIN_MS..CPU_SLEEP_MAX_MS`; write `artifacts/cpu-${taskId}.txt`; in one transaction with optimistic-lock, set task succeeded AND null out the lease columns, insert `artifacts` row, INSERT child SSH task with `ON CONFLICT (parent_task_id) DO NOTHING`. Helpers (`runWorkerHandler`, claim/release SQL) extracted to `lib/worker.ts` for reuse.
 
 **Acceptance criteria:**
-- [ ] BullMQ message `{taskId, leaseId, attempts}` triggers the handler.
-- [ ] Atomic claim refuses to proceed if `task.status != 'queued'`, `task.attempts != expected`, or `lease.released_at IS NOT NULL`. 0-row update → silent return.
-- [ ] On success, `tasks.status='succeeded'`, `artifacts` row exists, lease released, exactly one new pending SSH child exists.
+- [ ] BullMQ message `{taskId, leaseToken, attempts}` triggers the handler.
+- [ ] Atomic claim refuses to proceed if `task.status != 'queued'`, `task.attempts != expected`, or `task.lease_token != $messageToken`. 0-row update → silent return.
+- [ ] On success, `tasks.status='succeeded'`, `artifacts` row exists, `lease_token IS NULL` and `lease_expires_at IS NULL`, exactly one new pending SSH child exists.
 - [ ] No artifact / no lease release / no child SSH if optimistic UPDATE returns 0 rows.
 
 **Verification:**
@@ -215,7 +221,9 @@ Goal: one user submits one job, all N pipelines run to completion, training arti
 
 #### Task 7: SSH worker + barrier check
 
-**Description:** Implement `worker/ssh.ts` and `lib/barrier.ts`. SSH handler: claim → sleep `SSH_SLEEP_MS` → write `artifacts/ssh-${taskId}.txt` → verify file exists (`fs.access` outside tx) → in tx, insert artifact row, mark task succeeded, release lease, run barrier check. Extend the scheduler from T5 to also dispatch SSH tasks (independent slot pool, no backpressure yet).
+> Amended by ADR-0001 (2026-05-04): inherits the lease helper changes from T6 (claim by `lease_token`, release by NULLing lease columns). Barrier logic is untouched — it counts `artifacts` rows and never read `leases`. Re-verify under T22.
+
+**Description:** Implement `worker/ssh.ts` and `lib/barrier.ts`. SSH handler: claim → sleep `SSH_SLEEP_MS` → write `artifacts/ssh-${taskId}.txt` → verify file exists (`fs.access` outside tx) → in tx, insert artifact row, mark task succeeded AND null out lease columns, run barrier check. Extend the scheduler from T5 to also dispatch SSH tasks (independent slot pool, no backpressure yet).
 
 **Acceptance criteria:**
 - [ ] SSH tasks are dispatched once they become `pending` (after their CPU parent succeeds).
@@ -240,7 +248,9 @@ Goal: one user submits one job, all N pipelines run to completion, training arti
 
 #### Task 8: Training worker + job completion
 
-**Description:** Implement `worker/training.ts`: claim → sleep `TRAINING_SLEEP_MS` → write `artifacts/train-${jobId}.txt` → in tx, mark task succeeded, release lease, `UPDATE jobs SET status='completed' WHERE id=$1 AND status NOT IN ('completed','failed')`. Extend scheduler to dispatch training tasks (third slot pool).
+> Amended by ADR-0001 (2026-05-04): inherits the lease helper changes from T6 (release nulls lease columns rather than UPDATEing `leases.released_at`). Re-verify under T22.
+
+**Description:** Implement `worker/training.ts`: claim → sleep `TRAINING_SLEEP_MS` → write `artifacts/train-${jobId}.txt` → in tx, mark task succeeded AND null out lease columns, `UPDATE jobs SET status='completed' WHERE id=$1 AND status NOT IN ('completed','failed')`. Extend scheduler to dispatch training tasks (third slot pool).
 
 **Acceptance criteria:**
 - [ ] Training task transitions `pending → queued → running → succeeded`.
@@ -303,12 +313,15 @@ Goal: the system survives worker crashes, hangs, and bursts of pending SSH work.
 
 #### Task 10: Lease heartbeat + scheduler reaper + job-failure propagation
 
-**Description:** Add `setInterval`-driven heartbeat that bumps `leases.heartbeat_at` and `expires_at` while a task runs (kept in `lib/worker.ts`). In the scheduler tick (before dispatching), reap leases where `expires_at < now() AND released_at IS NULL`: for each, mark the task `pending` (if `attempts < max_attempts`) or `failed`, and release the lease. On permanent failure, propagate `jobs.status='failed'`.
+> Amended by ADR-0001 (2026-05-04): heartbeat updates `tasks.lease_heartbeat_at` and `tasks.lease_expires_at` (gated by `lease_token = $token`, which replaces today's `released_at IS NULL` guard — a released lease has `lease_token=NULL` so the UPDATE no-ops). Reaper selects from `tasks` directly using the new partial `tasks_lease_expires_idx`. Reset-to-pending NULLs the lease columns; terminal failure leaves them set or NULLs them along with status — implementation choice in T22, but state must be self-consistent. Re-verify under T22.
+
+**Description:** Add `setInterval`-driven heartbeat that bumps `tasks.lease_heartbeat_at` and `tasks.lease_expires_at` while a task runs (kept in `lib/worker.ts`). In the scheduler tick (before dispatching), reap rows where `lease_expires_at < now() AND status IN ('queued','running')`: for each, mark the task `pending` (if `attempts < max_attempts`) or `failed`, and null out the lease columns. On permanent failure, propagate `jobs.status='failed'`.
 
 **Acceptance criteria:**
 - [ ] Heartbeat fires every `LEASE_HEARTBEAT_MS` while a task is running; stops on success, failure, or process death.
-- [ ] Reaper runs every tick, before fairness dispatch.
-- [ ] A task whose worker `kill -9`'d during sleep: lease expires within `LEASE_TTL_MS`; reaper resets to pending; next tick re-dispatches; eventually succeeds (fresh attempt).
+- [ ] Heartbeat UPDATE is gated by `lease_token = $token`, so it cannot resurrect a lease the finalize tx already released.
+- [ ] Reaper runs every tick, before fairness dispatch, and uses the partial `tasks_lease_expires_idx`.
+- [ ] A task whose worker `kill -9`'d during sleep: `lease_expires_at` slips past `now()` within `LEASE_TTL_MS`; reaper resets to pending (NULLing lease columns); next tick re-dispatches; eventually succeeds (fresh attempt).
 - [ ] A task that fails `MAX_ATTEMPTS` times: marked `failed`, the job becomes `failed`, no further dispatch, training never created.
 
 **Verification:**
@@ -456,11 +469,13 @@ Goal: the system survives worker crashes, hangs, and bursts of pending SSH work.
 
 #### Task 15: Fairness panel in dashboard
 
-**Description:** Add a "Fairness" panel to `app/page.tsx`: shows `running CPU: X/GLOBAL_CPU_SLOTS` globally, plus a per-user breakdown of running CPU/SSH/training counts. Backed by `GET /api/users` extended to include `runningCpu`, `runningSsh`, `runningTraining` derived from active leases.
+> Amended by ADR-0001 (2026-05-04): "active leases" data source moves from `leases WHERE released_at IS NULL` to `tasks WHERE lease_token IS NOT NULL AND lease_expires_at > now()`. Build this task only after T22 lands, so the API reads the new shape from day one.
+
+**Description:** Add a "Fairness" panel to `app/page.tsx`: shows `running CPU: X/GLOBAL_CPU_SLOTS` globally, plus a per-user breakdown of running CPU/SSH/training counts. Backed by `GET /api/users` extended to include `runningCpu`, `runningSsh`, `runningTraining` derived from `tasks` rows with an active lease (`lease_token IS NOT NULL AND lease_expires_at > now()`), grouped by `kind` and `user_id`.
 
 **Acceptance criteria:**
 - [ ] Panel updates via the same 1s poll as the job list.
-- [ ] Numbers reconcile with raw `psql` counts of `leases WHERE released_at IS NULL`.
+- [ ] Numbers reconcile with raw `psql` counts of `tasks WHERE lease_token IS NOT NULL AND lease_expires_at > now()`, grouped by kind and user_id.
 - [ ] When 3 users submit jobs simultaneously, panel visibly shows running counts converging toward equal split.
 
 **Verification:**
@@ -509,6 +524,77 @@ Goal: the system survives worker crashes, hangs, and bursts of pending SSH work.
 - [ ] `pnpm typecheck` clean.
 - [ ] `tasks/todo.md` is fully checked off.
 - [ ] Final review with human.
+
+---
+
+### Phase 4.5: Lease consolidation (ADR-0001)
+
+Goal: collapse the independent `leases` table into ownership columns on `tasks` (per ADR-0001). Must land before T15 (fairness panel) and T16 (verification scenarios) so those read the new shape from day one. T2 / T5 / T6 / T7 / T8 / T10 acceptance criteria have been amended in place; this phase is where the migration work actually executes and re-verifies them.
+
+#### Task 22: Lease-into-tasks migration + helper rename
+
+**Description:** Execute ADR-0001. Rewrite `db/schema.sql` to drop the `leases` table and its indexes; add `lease_token uuid`, `lease_expires_at timestamptz`, `lease_heartbeat_at timestamptz` columns to `tasks`; create the partial `tasks_lease_expires_idx ON tasks (lease_expires_at) WHERE lease_expires_at IS NOT NULL`. Rewrite all SQL paths in `lib/scheduler.ts` (reserveOneTask single-UPDATE, count subqueries, reaper) and `lib/worker.ts` (claim by `lease_token`, heartbeat gated by `lease_token`, finalize-* paths NULL the lease columns). Rename `DispatchMessage.leaseId` to `leaseToken` across `lib/queues.ts`, `lib/scheduler.ts`, `lib/worker.ts`, `worker/cpu.ts`, `worker/ssh.ts`, `worker/training.ts`. Update every test that asserts on `leases` table state to assert on `tasks.lease_*` instead. Apply via `pnpm db:reset` (lab convention — no online migration needed).
+
+**Acceptance criteria:**
+- [ ] `db/schema.sql` no longer contains `CREATE TABLE leases` or any `leases_*` index.
+- [ ] `tasks` has the three new columns, all nullable, default NULL.
+- [ ] Partial index `tasks_lease_expires_idx` exists.
+- [ ] `pnpm typecheck` clean.
+- [ ] All previously-passing tests in `lib/scheduler.test.ts`, `lib/worker.test.ts`, `db/schema.test.ts`, `worker/cpu.test.ts`, `worker/ssh.test.ts`, `worker/training.test.ts`, `lib/advisory-lock.test.ts` updated to the new schema and still passing.
+- [ ] BullMQ payload field is `leaseToken: string`; no remaining reference to `leaseId` in `lib/`, `worker/`, or tests.
+- [ ] T2, T5, T6, T7, T8, T10 acceptance criteria (already amended in place) all re-verify against the new code.
+
+**Verification:**
+- [ ] `grep -rn "leases\|leaseId" lib/ worker/ db/ scripts/ app/` returns no matches except inside ADR/replan-log references.
+- [ ] Manual happy-path run (Checkpoint B re-verification): 1 user, `PIPELINES_PER_JOB=200`, all chaos = 0 → job completes; `psql` shows no row in `tasks` with `lease_token IS NOT NULL` once the job is done.
+- [ ] Manual `kill -9` of worker mid-flight (Checkpoint C re-verification): job still completes; reaper picks up the orphaned `lease_expires_at`.
+
+**Dependencies:** T14 (chaos knobs are independent of the lease shape, but landing T22 after T14 keeps Phase 4 contiguous).
+
+**Files likely touched:**
+- `db/schema.sql`
+- `lib/scheduler.ts`, `lib/worker.ts`, `lib/queues.ts`
+- `worker/cpu.ts`, `worker/ssh.ts`, `worker/training.ts`, `worker/index.ts`
+- `lib/scheduler.test.ts`, `lib/worker.test.ts`, `db/schema.test.ts`
+- `worker/cpu.test.ts`, `worker/ssh.test.ts`, `worker/training.test.ts`
+- `lib/advisory-lock.test.ts`, `scripts/test-lock.ts` (if either touches lease shape)
+
+**Estimated scope:** L (touches every lease-aware module; mostly mechanical rewrites with one careful claim/heartbeat invariant change).
+
+---
+
+#### Task 23: Race test — `lease_token` fencing under reap-and-redispatch
+
+**Description:** Add a focused integration test (likely in `lib/scheduler.test.ts` or a new `lib/lease-fencing.test.ts`) that exercises the exact race the EXISTS-on-`leases` subquery used to close: dispatch a task → message captured but not yet claimed → force the lease to expire → reap (resets to pending, NULLs `lease_token`) → dispatch again (new `lease_token`) → both BullMQ messages now in flight. Two concurrent `claimTask` calls — one with the old token, one with the new — must result in exactly one successful claim. The other must return null silently.
+
+**Acceptance criteria:**
+- [ ] Test deterministically reproduces the dispatch → expire → re-dispatch sequence (no `setTimeout` — drive lease expiry by `UPDATE tasks SET lease_expires_at = now() - interval '1s'`).
+- [ ] Two `claimTask` calls run concurrently (`Promise.all`).
+- [ ] Exactly one returns a `ClaimedTask`; the other returns `null`.
+- [ ] After the dust settles: `tasks.attempts` incremented exactly once; `tasks.lease_token` matches the winning message; `tasks.status='running'`.
+- [ ] Repeating the test 10× is stable (no flaky pass/fail).
+
+**Verification:**
+- [ ] Run the test 10× via `pnpm test --run -t "<test name>"` — all green.
+- [ ] Mutation check: temporarily remove the `lease_token = $token` predicate from `claimTask`; the test must fail. Confirms the test actually exercises the fencing, not coincidence. Revert before commit.
+
+**Dependencies:** T22
+
+**Files likely touched:**
+- `lib/scheduler.test.ts` OR new `lib/lease-fencing.test.ts`
+- `lib/test-helpers.ts` (if a helper for forcing lease expiry is added)
+
+**Estimated scope:** S
+
+---
+
+### Checkpoint D.1: Lease consolidation verified
+
+- [ ] T22 + T23 complete.
+- [ ] All previously-passing tests green under the new schema.
+- [ ] Checkpoint B happy path re-verified.
+- [ ] Checkpoint C `kill -9` resilience re-verified.
+- [ ] **Human review** before resuming T15 / T16.
 
 ---
 
