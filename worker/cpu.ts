@@ -58,14 +58,14 @@ export async function runCpuTask(
   if (!claimed) return;
 
   const timeoutMs = opts.timeoutMs ?? getConfig().CPU_TIMEOUT_MS;
-  const heartbeat = startHeartbeat(msg.leaseId);
+  const heartbeat = startHeartbeat(msg.taskId, msg.leaseToken);
   try {
     const artifactPath = await withTimeout(doWork(claimed.taskId), timeoutMs);
     await access(artifactPath);
-    await finalizeCpuSuccess(claimed, msg.leaseId, artifactPath);
+    await finalizeCpuSuccess(claimed, artifactPath);
   } catch (err) {
     if (err instanceof StaleAttemptError) return;
-    await recordFailure(claimed, msg.leaseId, err);
+    await recordFailure(claimed, err);
   } finally {
     heartbeat.stop();
   }

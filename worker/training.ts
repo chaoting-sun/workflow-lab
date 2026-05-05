@@ -46,13 +46,13 @@ export async function runTrainingTask(
   if (!claimed) return;
 
   const timeoutMs = opts.timeoutMs ?? getConfig().TRAINING_TIMEOUT_MS;
-  const heartbeat = startHeartbeat(msg.leaseId);
+  const heartbeat = startHeartbeat(msg.taskId, msg.leaseToken);
   try {
     await withTimeout(doWork(claimed.jobId), timeoutMs);
-    await finalizeTrainingSuccess(claimed, msg.leaseId);
+    await finalizeTrainingSuccess(claimed);
   } catch (err) {
     if (err instanceof StaleAttemptError) return;
-    await recordFailure(claimed, msg.leaseId, err);
+    await recordFailure(claimed, err);
   } finally {
     heartbeat.stop();
   }

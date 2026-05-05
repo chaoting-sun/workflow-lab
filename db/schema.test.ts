@@ -15,6 +15,7 @@ const SCHEMA_SQL = readFileSync(
 const pool = new Pool({ connectionString: DATABASE_URL });
 
 async function dropAll(): Promise<void> {
+  // 'leases' is left here so older installs drop cleanly.
   await pool.query(`
     DROP TABLE IF EXISTS leases     CASCADE;
     DROP TABLE IF EXISTS artifacts  CASCADE;
@@ -73,11 +74,12 @@ describe("db/schema.sql", () => {
     `);
     const names = rows.map((r) => r.table_name);
     expect(names).toEqual(
-      expect.arrayContaining(["users", "jobs", "tasks", "artifacts", "leases"]),
+      expect.arrayContaining(["users", "jobs", "tasks", "artifacts"]),
     );
+    expect(names).not.toContain("leases");
   });
 
-  it("tasks has attempts, max_attempts, failure_reason, parent_task_id", async () => {
+  it("tasks has attempts, max_attempts, failure_reason, parent_task_id, lease_*", async () => {
     const { rows } = await pool.query<{ column_name: string }>(`
       SELECT column_name FROM information_schema.columns
       WHERE table_name='tasks' AND table_schema='public'
@@ -89,24 +91,24 @@ describe("db/schema.sql", () => {
         "max_attempts",
         "failure_reason",
         "parent_task_id",
+        "lease_token",
+        "lease_expires_at",
+        "lease_heartbeat_at",
       ]),
     );
   });
 
-  it("leases has acquired_at, heartbeat_at, expires_at, released_at", async () => {
-    const { rows } = await pool.query<{ column_name: string }>(`
-      SELECT column_name FROM information_schema.columns
-      WHERE table_name='leases' AND table_schema='public'
+  it("tasks lease_* columns are nullable (NULL = no active lease)", async () => {
+    const { rows } = await pool.query<{ column_name: string; is_nullable: string }>(`
+      SELECT column_name, is_nullable
+        FROM information_schema.columns
+       WHERE table_name='tasks' AND table_schema='public'
+         AND column_name IN ('lease_token','lease_expires_at','lease_heartbeat_at')
     `);
-    const cols = rows.map((r) => r.column_name);
-    expect(cols).toEqual(
-      expect.arrayContaining([
-        "acquired_at",
-        "heartbeat_at",
-        "expires_at",
-        "released_at",
-      ]),
-    );
+    expect(rows).toHaveLength(3);
+    for (const r of rows) {
+      expect(r.is_nullable).toBe("YES");
+    }
   });
 
   it("rejects jobs.pipelines_count = 0", async () => {
@@ -172,9 +174,9 @@ describe("db/schema.sql", () => {
     expect(defs.get("tasks_kind_status_user_idx")).toMatch(
       /\(kind, status, user_id\)/,
     );
-    expect(defs.get("leases_resource_released_idx")).toMatch(
-      /\(resource, released_at\)/,
-    );
+    const leaseExpires = defs.get("tasks_lease_expires_idx");
+    expect(leaseExpires).toMatch(/\(lease_expires_at\)/);
+    expect(leaseExpires).toMatch(/where.*lease_expires_at is not null/);
     const sshParent = defs.get("tasks_ssh_parent_unique_idx");
     expect(sshParent).toMatch(/\(parent_task_id\)/);
     expect(sshParent).toMatch(/where.*kind = 'ssh'/);

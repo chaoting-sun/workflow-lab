@@ -18,7 +18,7 @@ const PREFIX = `t6-cpu-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 let scratchDir: string;
 
 function msg(fx: QueuedTaskFixture): WorkerTaskMessage {
-  return { taskId: fx.taskId, leaseId: fx.leaseId, attempts: fx.attempts };
+  return { taskId: fx.taskId, leaseToken: fx.leaseToken, attempts: fx.attempts };
 }
 
 async function reset(): Promise<void> {
@@ -70,11 +70,11 @@ describe("runCpuTask", () => {
     await access(artifact.rows[0].path);
     expect(await readFile(artifact.rows[0].path, "utf-8")).toBe("hello");
 
-    const lease = await db.query<{ released_at: Date | null }>(
-      `SELECT released_at FROM leases WHERE id=$1`,
-      [fx.leaseId],
+    const lease = await db.query<{ lease_token: string | null }>(
+      `SELECT lease_token FROM tasks WHERE id=$1`,
+      [fx.taskId],
     );
-    expect(lease.rows[0].released_at).not.toBeNull();
+    expect(lease.rows[0].lease_token).toBeNull();
 
     const child = await db.query<{ count: string }>(
       `SELECT count(*)::text AS count FROM tasks WHERE parent_task_id=$1 AND kind='ssh'`,
@@ -88,7 +88,7 @@ describe("runCpuTask", () => {
     const fx = await makeQueuedCpuTaskWithLease(u.id);
 
     await runCpuTask(
-      { taskId: fx.taskId, leaseId: fx.leaseId, attempts: fx.attempts + 5 },
+      { taskId: fx.taskId, leaseToken: fx.leaseToken, attempts: fx.attempts + 5 },
       fastWork(),
     );
 
@@ -138,11 +138,11 @@ describe("runCpuTask", () => {
     );
     expect(artifact.rows[0].count).toBe("0");
 
-    const lease = await db.query<{ released_at: Date | null }>(
-      `SELECT released_at FROM leases WHERE id=$1`,
-      [fx.leaseId],
+    const lease = await db.query<{ lease_token: string | null }>(
+      `SELECT lease_token FROM tasks WHERE id=$1`,
+      [fx.taskId],
     );
-    expect(lease.rows[0].released_at).toBeNull();
+    expect(lease.rows[0].lease_token).not.toBeNull();
 
     const child = await db.query<{ count: string }>(
       `SELECT count(*)::text AS count FROM tasks WHERE parent_task_id=$1`,
@@ -151,7 +151,7 @@ describe("runCpuTask", () => {
     expect(child.rows[0].count).toBe("0");
   });
 
-  it("timeout (retryable): doWork outlasts the timeout → task reset to pending with failure_reason='timeout', lease released, no artifact, no SSH child", async () => {
+  it("timeout (retryable): doWork outlasts the timeout → task reset to pending with failure_reason='timeout', lease cleared, no artifact, no SSH child", async () => {
     const u = await createUser(`${PREFIX}-timeout-retry`);
     const fx = await makeQueuedCpuTaskWithLease(u.id);
 
@@ -172,11 +172,11 @@ describe("runCpuTask", () => {
     expect(task.rows[0].status).toBe("pending");
     expect(task.rows[0].failure_reason).toBe("timeout");
 
-    const lease = await db.query<{ released_at: Date | null }>(
-      `SELECT released_at FROM leases WHERE id=$1`,
-      [fx.leaseId],
+    const lease = await db.query<{ lease_token: string | null }>(
+      `SELECT lease_token FROM tasks WHERE id=$1`,
+      [fx.taskId],
     );
-    expect(lease.rows[0].released_at).not.toBeNull();
+    expect(lease.rows[0].lease_token).toBeNull();
 
     const artifact = await db.query<{ count: string }>(
       `SELECT count(*)::text AS count FROM artifacts WHERE task_id=$1`,

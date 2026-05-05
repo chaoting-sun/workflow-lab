@@ -18,7 +18,7 @@ const PREFIX = `t7-ssh-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 let scratchDir: string;
 
 function msg(fx: QueuedTaskFixture): WorkerTaskMessage {
-  return { taskId: fx.taskId, leaseId: fx.leaseId, attempts: fx.attempts };
+  return { taskId: fx.taskId, leaseToken: fx.leaseToken, attempts: fx.attempts };
 }
 
 async function reset(): Promise<void> {
@@ -70,11 +70,11 @@ describe("runSshTask", () => {
     await access(artifact.rows[0].path);
     expect(await readFile(artifact.rows[0].path, "utf-8")).toBe("hello");
 
-    const lease = await db.query<{ released_at: Date | null }>(
-      `SELECT released_at FROM leases WHERE id=$1`,
-      [fx.leaseId],
+    const lease = await db.query<{ lease_token: string | null }>(
+      `SELECT lease_token FROM tasks WHERE id=$1`,
+      [fx.taskId],
     );
-    expect(lease.rows[0].released_at).not.toBeNull();
+    expect(lease.rows[0].lease_token).toBeNull();
 
     const training = await db.query<{ status: string }>(
       `SELECT status FROM tasks WHERE job_id=$1 AND kind='training'`,
@@ -102,7 +102,7 @@ describe("runSshTask", () => {
     const fx = await makeQueuedSshTaskWithLease(u.id, 1);
 
     await runSshTask(
-      { taskId: fx.taskId, leaseId: fx.leaseId, attempts: fx.attempts + 5 },
+      { taskId: fx.taskId, leaseToken: fx.leaseToken, attempts: fx.attempts + 5 },
       fastWork(),
     );
 
@@ -151,11 +151,11 @@ describe("runSshTask", () => {
     );
     expect(a.rows[0].count).toBe("0");
 
-    const lease = await db.query<{ released_at: Date | null }>(
-      `SELECT released_at FROM leases WHERE id=$1`,
-      [fx.leaseId],
+    const lease = await db.query<{ lease_token: string | null }>(
+      `SELECT lease_token FROM tasks WHERE id=$1`,
+      [fx.taskId],
     );
-    expect(lease.rows[0].released_at).toBeNull();
+    expect(lease.rows[0].lease_token).not.toBeNull();
 
     const train = await db.query<{ count: string }>(
       `SELECT count(*)::text AS count FROM tasks WHERE job_id=$1 AND kind='training'`,
@@ -182,11 +182,11 @@ describe("runSshTask", () => {
     expect(t.rows[0].status).toBe("pending");
     expect(t.rows[0].failure_reason).toBe("timeout");
 
-    const lease = await db.query<{ released_at: Date | null }>(
-      `SELECT released_at FROM leases WHERE id=$1`,
-      [fx.leaseId],
+    const lease = await db.query<{ lease_token: string | null }>(
+      `SELECT lease_token FROM tasks WHERE id=$1`,
+      [fx.taskId],
     );
-    expect(lease.rows[0].released_at).not.toBeNull();
+    expect(lease.rows[0].lease_token).toBeNull();
 
     const training = await db.query<{ count: string }>(
       `SELECT count(*)::text AS count FROM tasks WHERE job_id=$1 AND kind='training'`,

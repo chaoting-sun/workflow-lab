@@ -4,15 +4,6 @@ import { runBarrierCheck } from "./barrier";
 import { failJob } from "./jobs";
 import { TimeoutError } from "./timeout";
 
-export async function releaseLease(
-  client: Queryable,
-  leaseId: string,
-): Promise<void> {
-  await client.query(`UPDATE leases SET released_at=now() WHERE id=$1`, [
-    leaseId,
-  ]);
-}
-
 export interface HeartbeatHandle {
   stop(): void;
 }
@@ -22,12 +13,14 @@ export interface HeartbeatOptions {
   ttlMs?: number;
 }
 
-// The reaper treats `expires_at < now() AND released_at IS NULL` as "worker
-// is dead", so a live worker must keep pushing expires_at forward. The
-// `released_at IS NULL` guard means we never resurrect a lease that the
-// finalize tx has released — the SQL is a no-op once released.
+// The reaper treats `lease_expires_at < now() AND lease columns set` as
+// "worker is dead", so a live worker must keep pushing lease_expires_at
+// forward. The `lease_token = $2` predicate means we never resurrect a
+// lease that the finalize tx has released — a released lease has
+// `lease_token=NULL`, so the UPDATE is a no-op.
 export function startHeartbeat(
-  leaseId: string,
+  taskId: string,
+  leaseToken: string,
   opts: HeartbeatOptions = {},
 ): HeartbeatHandle {
   const cfg = getConfig();
@@ -39,17 +32,17 @@ export function startHeartbeat(
     if (stopped) return;
     try {
       await db.query(
-        `UPDATE leases
-            SET heartbeat_at=now(),
-                expires_at=now() + ($2::bigint * interval '1 millisecond')
-          WHERE id=$1 AND released_at IS NULL`,
-        [leaseId, ttlMs],
+        `UPDATE tasks
+            SET lease_heartbeat_at = now(),
+                lease_expires_at   = now() + ($3::bigint * interval '1 millisecond')
+          WHERE id = $1 AND lease_token = $2`,
+        [taskId, leaseToken, ttlMs],
       );
     } catch (err) {
       // Heartbeat failure must never crash the worker process. Log and
       // continue — the next tick will retry. If the DB is durably broken
       // the lease will eventually expire and the reaper will pick it up.
-      console.error(`heartbeat for lease ${leaseId} failed:`, err);
+      console.error(`heartbeat for task ${taskId} failed:`, err);
     }
   };
 
@@ -72,7 +65,7 @@ export function startHeartbeat(
 
 export interface WorkerTaskMessage {
   taskId: string;
-  leaseId: string;
+  leaseToken: string;
   attempts: number;
 }
 
@@ -91,13 +84,14 @@ export class StaleAttemptError extends Error {
 }
 
 // Atomic claim: the compound WHERE on tasks rejects stale BullMQ deliveries
-// (status moved on, attempts moved on, or the lease was released); a null
-// return is the caller's signal to silently abort. The job-status promotion
-// is gated on `status='pending'` for idempotency across re-claims and so it
-// never overwrites a terminal 'completed'/'failed' state — and on
-// `id IN (SELECT job_id FROM claimed)` so a rejected claim leaves jobs
-// untouched. Both UPDATEs run in one CTE statement, so claim + promotion
-// commit (or roll back) together with a single round-trip.
+// (status moved on, attempts moved on, or the lease was released and a new
+// dispatch issued a different token); a null return is the caller's signal
+// to silently abort. The job-status promotion is gated on `status='pending'`
+// for idempotency across re-claims and so it never overwrites a terminal
+// 'completed'/'failed' state — and on `id IN (SELECT job_id FROM claimed)`
+// so a rejected claim leaves jobs untouched. Both UPDATEs run in one CTE
+// statement, so claim + promotion commit (or roll back) together with a
+// single round-trip.
 export async function claimTask(
   msg: WorkerTaskMessage,
 ): Promise<ClaimedTask | null> {
@@ -112,17 +106,14 @@ export async function claimTask(
         WHERE id = $1
           AND status = 'queued'
           AND attempts = $2
-          AND EXISTS (
-            SELECT 1 FROM leases
-             WHERE id = $3 AND task_id = $1 AND released_at IS NULL
-          )
+          AND lease_token = $3
         RETURNING attempts, job_id, user_id
      ), job_promoted AS (
        UPDATE jobs SET status='running'
         WHERE id IN (SELECT job_id FROM claimed) AND status = 'pending'
      )
      SELECT attempts, job_id, user_id FROM claimed`,
-    [msg.taskId, msg.attempts, msg.leaseId],
+    [msg.taskId, msg.attempts, msg.leaseToken],
   );
   if (result.rowCount === 0) return null;
   const row = result.rows[0];
@@ -134,24 +125,34 @@ export async function claimTask(
   };
 }
 
-// Success transaction for the CPU stage. Every write is gated on
-// `attempts=myAttempts` so a concurrent reaper / parallel worker that
-// bumped attempts since the claim leaves no side effects: we throw
-// StaleAttemptError, the tx rolls back, and the caller swallows it.
+// Optimistic-locked success write. Gated on `attempts=myAttempts` so a
+// concurrent reaper / parallel worker that bumped attempts since the claim
+// leaves no side effects: we throw StaleAttemptError, the tx rolls back, and
+// the caller swallows it. Used by all three finalizeXSuccess paths.
+async function markTaskSucceeded(
+  tx: Queryable,
+  claimed: ClaimedTask,
+): Promise<void> {
+  const upd = await tx.query(
+    `UPDATE tasks
+        SET status='succeeded',
+            finished_at=now(),
+            lease_token=NULL,
+            lease_expires_at=NULL,
+            lease_heartbeat_at=NULL
+      WHERE id=$1 AND attempts=$2 AND status='running'
+      RETURNING id`,
+    [claimed.taskId, claimed.myAttempts],
+  );
+  if (upd.rowCount === 0) throw new StaleAttemptError();
+}
+
 export async function finalizeCpuSuccess(
   claimed: ClaimedTask,
-  leaseId: string,
   artifactPath: string,
 ): Promise<void> {
   await db.tx(async (tx) => {
-    const upd = await tx.query(
-      `UPDATE tasks
-          SET status='succeeded', finished_at=now()
-        WHERE id=$1 AND attempts=$2 AND status='running'
-        RETURNING id`,
-      [claimed.taskId, claimed.myAttempts],
-    );
-    if (upd.rowCount === 0) throw new StaleAttemptError();
+    await markTaskSucceeded(tx, claimed);
 
     await tx.query(
       `INSERT INTO artifacts (task_id, path)
@@ -159,8 +160,6 @@ export async function finalizeCpuSuccess(
          ON CONFLICT (task_id) DO NOTHING`,
       [claimed.taskId, artifactPath],
     );
-
-    await releaseLease(tx, leaseId);
 
     // Partial unique index on tasks (parent_task_id) WHERE kind='ssh'
     // makes the SSH-child insert idempotent across retried finalizes.
@@ -173,25 +172,15 @@ export async function finalizeCpuSuccess(
   });
 }
 
-// Job-completion is the only side effect outside the task/lease pair: the
+// Job-completion is the only side effect outside the task row: the
 // `status NOT IN ('completed','failed')` guard makes it idempotent across
 // re-deliveries and prevents a successful retry from clobbering a job that
 // was already permanently failed.
 export async function finalizeTrainingSuccess(
   claimed: ClaimedTask,
-  leaseId: string,
 ): Promise<void> {
   await db.tx(async (tx) => {
-    const upd = await tx.query(
-      `UPDATE tasks
-          SET status='succeeded', finished_at=now()
-        WHERE id=$1 AND attempts=$2 AND status='running'
-        RETURNING id`,
-      [claimed.taskId, claimed.myAttempts],
-    );
-    if (upd.rowCount === 0) throw new StaleAttemptError();
-
-    await releaseLease(tx, leaseId);
+    await markTaskSucceeded(tx, claimed);
 
     await tx.query(
       `UPDATE jobs
@@ -204,23 +193,22 @@ export async function finalizeTrainingSuccess(
 
 // Worker-side failure finalize. Writes status='pending' (retryable) or
 // 'failed' (terminal) along with failure_reason in one optimistic-locked
-// UPDATE; releases the lease (idempotent on already-released leases); on a
-// terminal failure, propagates jobs.status='failed' so barriers waiting on
-// the dead task don't hang forever.
+// UPDATE that also clears the lease columns; on a terminal failure,
+// propagates jobs.status='failed' so barriers waiting on the dead task
+// don't hang forever.
 //
 // Returns false if the optimistic guard rejected the write (a parallel reaper
 // or worker mutated `attempts` since our claim), true otherwise. The caller
 // should treat false as "another actor handled the outcome — drop it".
 export async function finalizeTaskFailure(
   claimed: ClaimedTask,
-  leaseId: string,
   reason: string,
 ): Promise<boolean> {
   return db.tx(async (tx) => {
     // The CASE branches read max_attempts from the same row the WHERE clause
     // matched, so we never race a concurrent UPDATE of max_attempts.
-    // started_at is reset on retry so the next claim's started_at reflects
-    // the actual run start; on terminal failure we leave it alone for audit.
+    // On terminal failure started_at is preserved for audit; on retry it is
+    // reset so the next claim's started_at reflects the actual run start.
     const upd = await tx.query<{ status: string }>(
       `UPDATE tasks
           SET status = CASE
@@ -235,18 +223,15 @@ export async function finalizeTaskFailure(
               started_at = CASE
                              WHEN attempts >= max_attempts THEN started_at
                              ELSE NULL
-                           END
+                           END,
+              lease_token = NULL,
+              lease_expires_at = NULL,
+              lease_heartbeat_at = NULL
         WHERE id=$1 AND attempts=$2 AND status='running'
         RETURNING status`,
       [claimed.taskId, claimed.myAttempts, reason],
     );
     if (upd.rowCount === 0) return false;
-
-    await tx.query(
-      `UPDATE leases SET released_at=now()
-        WHERE id=$1 AND released_at IS NULL`,
-      [leaseId],
-    );
 
     if (upd.rows[0].status === "failed") {
       await failJob(tx, claimed.jobId);
@@ -267,11 +252,10 @@ function failureReason(err: unknown): string {
 // finalize is left to the lease reaper.
 export async function recordFailure(
   claimed: ClaimedTask,
-  leaseId: string,
   err: unknown,
 ): Promise<void> {
   try {
-    await finalizeTaskFailure(claimed, leaseId, failureReason(err));
+    await finalizeTaskFailure(claimed, failureReason(err));
   } catch (failErr) {
     console.error(
       `finalizeTaskFailure failed for task ${claimed.taskId}:`,
@@ -284,18 +268,10 @@ export async function recordFailure(
 // for the job is present; see lib/barrier.ts for serialisation guarantees.
 export async function finalizeSshSuccess(
   claimed: ClaimedTask,
-  leaseId: string,
   artifactPath: string,
 ): Promise<void> {
   await db.tx(async (tx) => {
-    const upd = await tx.query(
-      `UPDATE tasks
-          SET status='succeeded', finished_at=now()
-        WHERE id=$1 AND attempts=$2 AND status='running'
-        RETURNING id`,
-      [claimed.taskId, claimed.myAttempts],
-    );
-    if (upd.rowCount === 0) throw new StaleAttemptError();
+    await markTaskSucceeded(tx, claimed);
 
     await tx.query(
       `INSERT INTO artifacts (task_id, path)
@@ -303,8 +279,6 @@ export async function finalizeSshSuccess(
          ON CONFLICT (task_id) DO NOTHING`,
       [claimed.taskId, artifactPath],
     );
-
-    await releaseLease(tx, leaseId);
 
     await runBarrierCheck(tx, claimed.jobId);
   });

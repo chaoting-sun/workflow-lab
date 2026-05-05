@@ -18,7 +18,7 @@ const PREFIX = `t8-train-${Date.now()}-${Math.random().toString(36).slice(2, 7)}
 let scratchDir: string;
 
 function msg(fx: QueuedTaskFixture): WorkerTaskMessage {
-  return { taskId: fx.taskId, leaseId: fx.leaseId, attempts: fx.attempts };
+  return { taskId: fx.taskId, leaseToken: fx.leaseToken, attempts: fx.attempts };
 }
 
 async function reset(): Promise<void> {
@@ -61,11 +61,11 @@ describe("runTrainingTask", () => {
     );
     expect(task.rows[0].status).toBe("succeeded");
 
-    const lease = await db.query<{ released_at: Date | null }>(
-      `SELECT released_at FROM leases WHERE id=$1`,
-      [fx.leaseId],
+    const lease = await db.query<{ lease_token: string | null }>(
+      `SELECT lease_token FROM tasks WHERE id=$1`,
+      [fx.taskId],
     );
-    expect(lease.rows[0].released_at).not.toBeNull();
+    expect(lease.rows[0].lease_token).toBeNull();
 
     const job = await db.query<{ status: string; completed_at: Date | null }>(
       `SELECT status, completed_at FROM jobs WHERE id=$1`,
@@ -84,7 +84,7 @@ describe("runTrainingTask", () => {
     const fx = await makeQueuedTrainingTaskWithLease(u.id);
 
     await runTrainingTask(
-      { taskId: fx.taskId, leaseId: fx.leaseId, attempts: fx.attempts + 5 },
+      { taskId: fx.taskId, leaseToken: fx.leaseToken, attempts: fx.attempts + 5 },
       fastWork(),
     );
 
@@ -124,11 +124,11 @@ describe("runTrainingTask", () => {
     );
     expect(t.rows[0].status).not.toBe("succeeded");
 
-    const lease = await db.query<{ released_at: Date | null }>(
-      `SELECT released_at FROM leases WHERE id=$1`,
-      [fx.leaseId],
+    const lease = await db.query<{ lease_token: string | null }>(
+      `SELECT lease_token FROM tasks WHERE id=$1`,
+      [fx.taskId],
     );
-    expect(lease.rows[0].released_at).toBeNull();
+    expect(lease.rows[0].lease_token).not.toBeNull();
 
     const job = await db.query<{ status: string }>(
       `SELECT status FROM jobs WHERE id=$1`,
@@ -151,19 +151,21 @@ describe("runTrainingTask", () => {
     expect(firstCompletedAt).not.toBeNull();
 
     // Manually reset the task and reissue a lease so we can replay the worker.
-    await db.query(
-      `UPDATE tasks SET status='queued', attempts=0, finished_at=NULL WHERE id=$1`,
+    const lease2 = await db.query<{ lease_token: string }>(
+      `UPDATE tasks
+          SET status='queued',
+              attempts=0,
+              finished_at=NULL,
+              lease_token=gen_random_uuid(),
+              lease_expires_at=now() + interval '1 minute',
+              lease_heartbeat_at=now()
+        WHERE id=$1
+        RETURNING lease_token`,
       [fx.taskId],
-    );
-    const lease2 = await db.query<{ id: string }>(
-      `INSERT INTO leases (task_id, user_id, resource, expires_at)
-         VALUES ($1, $2, 'training', now() + interval '1 minute')
-         RETURNING id`,
-      [fx.taskId, u.id],
     );
 
     await runTrainingTask(
-      { taskId: fx.taskId, leaseId: lease2.rows[0].id, attempts: 0 },
+      { taskId: fx.taskId, leaseToken: lease2.rows[0].lease_token, attempts: 0 },
       fastWork(),
     );
 
@@ -225,11 +227,11 @@ describe("runTrainingTask", () => {
     expect(t.rows[0].status).toBe("pending");
     expect(t.rows[0].failure_reason).toBe("timeout");
 
-    const lease = await db.query<{ released_at: Date | null }>(
-      `SELECT released_at FROM leases WHERE id=$1`,
-      [fx.leaseId],
+    const lease = await db.query<{ lease_token: string | null }>(
+      `SELECT lease_token FROM tasks WHERE id=$1`,
+      [fx.taskId],
     );
-    expect(lease.rows[0].released_at).not.toBeNull();
+    expect(lease.rows[0].lease_token).toBeNull();
 
     const job = await db.query<{ status: string }>(
       `SELECT status FROM jobs WHERE id=$1`,

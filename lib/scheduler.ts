@@ -1,11 +1,10 @@
 import { db } from "./db";
 import { getConfig } from "./config";
 import { failJob } from "./jobs";
-import { releaseLease } from "./worker";
 
 export interface DispatchMessage {
   taskId: string;
-  leaseId: string;
+  leaseToken: string;
   attempts: number;
 }
 
@@ -21,87 +20,74 @@ export interface SchedulerQueues {
 
 type DispatchKind = "cpu" | "ssh" | "training";
 
-// `kind` doubles as the leases.resource value: every CPU lease tracks CPU
-// slot usage, every SSH lease tracks SSH slot usage, every training lease
-// tracks training slot usage. Each kind has its own independent slot pool.
-
-// Picks the next pending task of `kind` using fairness ordering (least active
-// leases of the same resource per user, then oldest job, then oldest task),
-// creates a lease, and flips the task to 'queued' — all in one transaction.
-// Caller enqueues to BullMQ outside the transaction: never hold a DB
-// transaction open across a BullMQ enqueue.
+// Caller enqueues to BullMQ outside the DB call: never hold a DB transaction
+// open across a BullMQ enqueue.
+//
+// Sole writer of `status='queued'` from `pending`. Composed with the reaper's
+// `running → pending` step, both writes leave `attempts` untouched —
+// see docs/task-lifecycle.md "running → queued puzzle".
 async function reserveOneTask(
   kind: DispatchKind,
   leaseTtlMs: number,
 ): Promise<DispatchMessage | null> {
-  return db.tx(async (tx) => {
-    // Fairness ordering, evaluated per candidate row before SKIP LOCKED:
-    //   1. active leases of this resource for the candidate's user (cross-user
-    //      fairness — one user's active load can't block another user).
-    //   2. active leases of this resource for the candidate's job (same-user
-    //      fairness — two jobs from one user interleave instead of A draining
-    //      before B starts).
-    const pick = await tx.query<{
-      task_id: string;
-      user_id: string;
-      attempts: number;
-    }>(
-      `SELECT t.id AS task_id, t.user_id, t.attempts
+  // Fairness ordering, evaluated per candidate row before SKIP LOCKED:
+  //   1. active leases of this kind for the candidate's user (cross-user
+  //      fairness — one user's active load can't block another user).
+  //   2. active leases of this kind for the candidate's job (same-user
+  //      fairness — two jobs from one user interleave instead of A draining
+  //      before B starts).
+  const result = await db.query<{
+    task_id: string;
+    attempts: number;
+    lease_token: string;
+  }>(
+    `WITH pick AS (
+       SELECT t.id, t.attempts
          FROM tasks t
          JOIN jobs j ON j.id = t.job_id
         WHERE t.kind = $1 AND t.status = 'pending'
         ORDER BY (
-                  SELECT count(*) FROM leases l
-                   WHERE l.user_id = t.user_id
-                     AND l.resource = $1
-                     AND l.released_at IS NULL
+                  SELECT count(*) FROM tasks lt
+                   WHERE lt.user_id = t.user_id
+                     AND lt.kind = $1
+                     AND lt.lease_token IS NOT NULL
                 ) ASC,
                  (
-                  SELECT count(*) FROM leases l
-                    JOIN tasks lt ON lt.id = l.task_id
+                  SELECT count(*) FROM tasks lt
                    WHERE lt.job_id = t.job_id
-                     AND l.resource = $1
-                     AND l.released_at IS NULL
+                     AND lt.kind = $1
+                     AND lt.lease_token IS NOT NULL
                 ) ASC,
                  j.created_at ASC,
                  t.created_at ASC
         LIMIT 1
-        FOR UPDATE OF t SKIP LOCKED`,
-      [kind],
-    );
-    if (pick.rowCount === 0) return null;
-    const row = pick.rows[0];
-
-    const lease = await tx.query<{ id: string }>(
-      `INSERT INTO leases (task_id, user_id, resource, expires_at)
-            VALUES ($1, $2, $3, now() + ($4::bigint * interval '1 millisecond'))
-         RETURNING id`,
-      [row.task_id, row.user_id, kind, leaseTtlMs],
-    );
-
-    // Sole writer of `status='queued'`. The SELECT above filters
-    // `status='pending'`, so this is also the only path producing the
-    // observed `running → queued` outcome — composed with the reaper's
-    // `running → pending` step, both writes leave `attempts` untouched.
-    // See docs/task-lifecycle.md "running → queued puzzle".
-    await tx.query(`UPDATE tasks SET status='queued' WHERE id=$1`, [
-      row.task_id,
-    ]);
-
-    return {
-      taskId: row.task_id,
-      attempts: row.attempts,
-      leaseId: lease.rows[0].id,
-    };
-  });
+        FOR UPDATE OF t SKIP LOCKED
+     )
+     UPDATE tasks
+        SET status = 'queued',
+            lease_token = gen_random_uuid(),
+            lease_expires_at = now() + ($2::bigint * interval '1 millisecond'),
+            lease_heartbeat_at = now()
+       FROM pick
+      WHERE tasks.id = pick.id
+      RETURNING tasks.id AS task_id, pick.attempts, tasks.lease_token`,
+    [kind, leaseTtlMs],
+  );
+  if (result.rowCount === 0) return null;
+  const row = result.rows[0];
+  return {
+    taskId: row.task_id,
+    attempts: row.attempts,
+    leaseToken: row.lease_token,
+  };
 }
 
-async function countActiveLeases(resource: DispatchKind): Promise<number> {
+async function countActiveLeases(kind: DispatchKind): Promise<number> {
   const { rows } = await db.query<{ count: string }>(
     `SELECT count(*)::text AS count
-       FROM leases
-      WHERE resource = $1 AND released_at IS NULL`,
-    [resource],
+       FROM tasks
+      WHERE kind = $1 AND lease_token IS NOT NULL`,
+    [kind],
   );
   return Number(rows[0].count);
 }
@@ -115,11 +101,11 @@ async function countSshBacklog(): Promise<number> {
   return Number(rows[0].count);
 }
 
-// Crash safety: if `queue.add` throws after the lease has been committed, the
-// task is left as 'queued' with an active lease but no BullMQ message. The
-// reaper resets it on lease expiry. We propagate the error so the caller stops
-// the loop early — re-trying here would only pile up orphan leases against a
-// broken queue.
+// Crash safety: if `queue.add` throws after the reserve UPDATE has been
+// committed, the task is left as 'queued' with an active lease but no BullMQ
+// message. The reaper resets it on lease expiry. We propagate the error so
+// the caller stops the loop early — re-trying here would only pile up orphan
+// leases against a broken queue.
 async function dispatchKind(
   queue: DispatchQueue,
   kind: DispatchKind,
@@ -141,11 +127,11 @@ async function dispatchKind(
   return dispatched;
 }
 
-// Death-detection: a lease whose `expires_at` slipped past now() without
-// `released_at` being set means the worker stopped heartbeating (process
-// crash, hang, GC stall past the TTL). The reaper runs once per scheduler
-// tick, BEFORE dispatch, so freed slots are visible to fairness counting in
-// the same tick.
+// Death-detection: a row whose `lease_expires_at` slipped past now() without
+// the lease being released (lease_token NULLed) means the worker stopped
+// heartbeating (process crash, hang, GC stall past the TTL). The reaper runs
+// once per scheduler tick, BEFORE dispatch, so freed slots are visible to
+// fairness counting in the same tick.
 //
 // `attempts` is NOT incremented here — the next claimTask bumps it. If we
 // also bumped here, an honest worker that resumes after a brief pause and
@@ -159,43 +145,66 @@ async function dispatchKind(
 // downstream consumers stop waiting on a barrier that can never fire.
 export async function reapExpiredLeases(): Promise<number> {
   return db.tx(async (tx) => {
+    // Lock expired rows up-front so a parallel reaper or worker can't
+    // double-process them.
     const expired = await tx.query<{
-      lease_id: string;
       task_id: string;
       job_id: string;
-      attempts: number;
-      max_attempts: number;
+      retryable: boolean;
     }>(
-      `SELECT l.id AS lease_id, l.task_id, t.job_id,
-              t.attempts, t.max_attempts
-         FROM leases l
-         JOIN tasks t ON t.id = l.task_id
-        WHERE l.released_at IS NULL
-          AND l.expires_at < now()
-        FOR UPDATE OF l SKIP LOCKED`,
+      `SELECT id AS task_id, job_id, (attempts < max_attempts) AS retryable
+         FROM tasks
+        WHERE lease_expires_at < now()
+          AND status IN ('queued','running')
+        FOR UPDATE SKIP LOCKED`,
     );
+    if (expired.rowCount === 0) return 0;
 
+    const retryableIds: string[] = [];
+    const failedJobIds: string[] = [];
+    const failedTaskIds: string[] = [];
     for (const row of expired.rows) {
-      const retryable = row.attempts < row.max_attempts;
-      if (retryable) {
-        await tx.query(
-          `UPDATE tasks
-              SET status='pending', started_at=NULL
-            WHERE id=$1 AND status IN ('queued','running')`,
-          [row.task_id],
-        );
+      if (row.retryable) {
+        retryableIds.push(row.task_id);
       } else {
-        await tx.query(
-          `UPDATE tasks
-              SET status='failed',
-                  failure_reason='lease_expired',
-                  finished_at=now()
-            WHERE id=$1 AND status NOT IN ('succeeded','failed')`,
-          [row.task_id],
-        );
-        await failJob(tx, row.job_id);
+        failedTaskIds.push(row.task_id);
+        failedJobIds.push(row.job_id);
       }
-      await releaseLease(tx, row.lease_id);
+    }
+
+    if (retryableIds.length > 0) {
+      await tx.query(
+        `UPDATE tasks
+            SET status='pending',
+                started_at=NULL,
+                lease_token=NULL,
+                lease_expires_at=NULL,
+                lease_heartbeat_at=NULL
+          WHERE id = ANY($1::uuid[])
+            AND status IN ('queued','running')`,
+        [retryableIds],
+      );
+    }
+
+    if (failedTaskIds.length > 0) {
+      await tx.query(
+        `UPDATE tasks
+            SET status='failed',
+                failure_reason='lease_expired',
+                finished_at=now(),
+                lease_token=NULL,
+                lease_expires_at=NULL,
+                lease_heartbeat_at=NULL
+          WHERE id = ANY($1::uuid[])
+            AND status NOT IN ('succeeded','failed')`,
+        [failedTaskIds],
+      );
+      // failJob is idempotent (gated on status NOT IN ('completed','failed'))
+      // so deduping the job_id list is a perf nicety, not a correctness need.
+      const uniqueJobIds = Array.from(new Set(failedJobIds));
+      for (const jobId of uniqueJobIds) {
+        await failJob(tx, jobId);
+      }
     }
 
     return expired.rowCount ?? 0;
@@ -248,9 +257,8 @@ export function runSchedulerLoop(
   };
 
   // Reap first so freed slots are counted in this tick's dispatch. CPU, SSH
-  // and training dispatch touch disjoint leases.resource values and disjoint
-  // tasks.kind rows, so they share no row-level locks and can run in parallel
-  // within a single scheduler instance.
+  // and training dispatch touch disjoint kinds and so share no row-level
+  // locks — they can run in parallel within a single scheduler instance.
   const loop = (): void => {
     inFlight = (async () => {
       try {

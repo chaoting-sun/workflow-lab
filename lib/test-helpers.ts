@@ -30,13 +30,27 @@ export async function ensureSchema(): Promise<void> {
 export interface QueuedTaskFixture {
   jobId: string;
   taskId: string;
-  leaseId: string;
+  leaseToken: string;
   attempts: number;
   userId: string;
 }
 
-// Forge a (queued task + active CPU lease) pair so worker tests can exercise
+// Forge a (queued task + active lease) pair so worker tests can exercise
 // claim/finalize without booting the scheduler.
+async function leaseTask(taskId: string): Promise<string> {
+  const { rows } = await db.query<{ lease_token: string }>(
+    `UPDATE tasks
+        SET status='queued',
+            lease_token=gen_random_uuid(),
+            lease_expires_at=now() + interval '1 minute',
+            lease_heartbeat_at=now()
+      WHERE id=$1
+      RETURNING lease_token`,
+    [taskId],
+  );
+  return rows[0].lease_token;
+}
+
 export async function makeQueuedCpuTaskWithLease(
   userId: string,
 ): Promise<QueuedTaskFixture> {
@@ -47,23 +61,11 @@ export async function makeQueuedCpuTaskWithLease(
   );
   const taskId = t.rows[0].id;
   const attempts = t.rows[0].attempts;
-  await db.query(`UPDATE tasks SET status='queued' WHERE id=$1`, [taskId]);
-  const lease = await db.query<{ id: string }>(
-    `INSERT INTO leases (task_id, user_id, resource, expires_at)
-       VALUES ($1, $2, 'cpu', now() + interval '1 minute')
-       RETURNING id`,
-    [taskId, userId],
-  );
-  return {
-    jobId: job.jobId,
-    taskId,
-    leaseId: lease.rows[0].id,
-    attempts,
-    userId,
-  };
+  const leaseToken = await leaseTask(taskId);
+  return { jobId: job.jobId, taskId, leaseToken, attempts, userId };
 }
 
-// Forge a queued training task + active training lease under a fresh job.
+// Forge a queued training task + active lease under a fresh job.
 // Bypasses the barrier / SSH stages — used by training-worker tests that
 // only care about the claim/finalize transition.
 export async function makeQueuedTrainingTaskWithLease(
@@ -78,22 +80,45 @@ export async function makeQueuedTrainingTaskWithLease(
   );
   const taskId = ins.rows[0].id;
   const attempts = ins.rows[0].attempts;
-  const lease = await db.query<{ id: string }>(
-    `INSERT INTO leases (task_id, user_id, resource, expires_at)
-       VALUES ($1, $2, 'training', now() + interval '1 minute')
-       RETURNING id`,
-    [taskId, userId],
+  const leaseToken = await leaseTask(taskId);
+  return { jobId: job.jobId, taskId, leaseToken, attempts, userId };
+}
+
+// Forge a queued CPU task whose lease has already expired (lease_expires_at
+// in the past). Used by reaper tests; `attempts`/`maxAttempts` overrides
+// drive the retryable vs terminal branches.
+export async function makeQueuedCpuTaskWithExpiredLease(
+  userId: string,
+  opts: { attempts?: number; maxAttempts?: number } = {},
+): Promise<QueuedTaskFixture> {
+  const job = await createJob({ userId, pipelinesCount: 1 });
+  const t = await db.query<{ id: string }>(
+    `SELECT id FROM tasks WHERE job_id=$1 LIMIT 1`,
+    [job.jobId],
+  );
+  const taskId = t.rows[0].id;
+  const upd = await db.query<{ lease_token: string; attempts: number }>(
+    `UPDATE tasks
+        SET status='queued',
+            attempts=$2,
+            max_attempts=$3,
+            lease_token=gen_random_uuid(),
+            lease_expires_at=now() - interval '1 second',
+            lease_heartbeat_at=now() - interval '5 seconds'
+      WHERE id=$1
+      RETURNING lease_token, attempts`,
+    [taskId, opts.attempts ?? 0, opts.maxAttempts ?? 3],
   );
   return {
     jobId: job.jobId,
     taskId,
-    leaseId: lease.rows[0].id,
-    attempts,
+    leaseToken: upd.rows[0].lease_token,
+    attempts: upd.rows[0].attempts,
     userId,
   };
 }
 
-// Forge a queued SSH task + active SSH lease under a fresh job. The job has
+// Forge a queued SSH task + active lease under a fresh job. The job has
 // `pipelinesCount` CPU pending tasks (untouched), one of which is reused as
 // the SSH parent. Use pipelinesCount=1 to exercise the barrier-fires path
 // after this SSH succeeds; pipelinesCount>1 to exercise the partial path.
@@ -114,17 +139,6 @@ export async function makeQueuedSshTaskWithLease(
   );
   const taskId = ins.rows[0].id;
   const attempts = ins.rows[0].attempts;
-  const lease = await db.query<{ id: string }>(
-    `INSERT INTO leases (task_id, user_id, resource, expires_at)
-       VALUES ($1, $2, 'ssh', now() + interval '1 minute')
-       RETURNING id`,
-    [taskId, userId],
-  );
-  return {
-    jobId: job.jobId,
-    taskId,
-    leaseId: lease.rows[0].id,
-    attempts,
-    userId,
-  };
+  const leaseToken = await leaseTask(taskId);
+  return { jobId: job.jobId, taskId, leaseToken, attempts, userId };
 }

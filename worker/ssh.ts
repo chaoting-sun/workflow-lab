@@ -56,14 +56,14 @@ export async function runSshTask(
   if (!claimed) return;
 
   const timeoutMs = opts.timeoutMs ?? getConfig().SSH_TIMEOUT_MS;
-  const heartbeat = startHeartbeat(msg.leaseId);
+  const heartbeat = startHeartbeat(msg.taskId, msg.leaseToken);
   try {
     const artifactPath = await withTimeout(doWork(claimed.taskId), timeoutMs);
     await access(artifactPath);
-    await finalizeSshSuccess(claimed, msg.leaseId, artifactPath);
+    await finalizeSshSuccess(claimed, artifactPath);
   } catch (err) {
     if (err instanceof StaleAttemptError) return;
-    await recordFailure(claimed, msg.leaseId, err);
+    await recordFailure(claimed, err);
   } finally {
     heartbeat.stop();
   }

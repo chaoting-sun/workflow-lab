@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { db, closeDb } from "./db";
-import { ensureSchema } from "./test-helpers";
+import { ensureSchema, makeQueuedCpuTaskWithExpiredLease } from "./test-helpers";
 import { getConfig } from "./config";
 import { createUser } from "./users";
 import { createJob } from "./jobs";
@@ -25,7 +25,7 @@ class FakeQueue implements DispatchQueue {
 }
 
 async function reset(): Promise<void> {
-  // Cascades wipe jobs/tasks/artifacts/leases.
+  // Cascades wipe jobs/tasks/artifacts.
   await db.query(`DELETE FROM users WHERE name LIKE $1`, [`${PREFIX}%`]);
 }
 
@@ -45,11 +45,13 @@ afterAll(async () => {
 // a real worker pipeline existing yet.
 async function fillActiveCpuLeases(userId: string, count: number): Promise<void> {
   const { jobId } = await createJob({ userId, pipelinesCount: count });
-  await db.query(`UPDATE tasks SET status='running' WHERE job_id=$1`, [jobId]);
   await db.query(
-    `INSERT INTO leases (task_id, user_id, resource, expires_at)
-       SELECT id, user_id, 'cpu', now() + interval '1 minute'
-         FROM tasks WHERE job_id=$1`,
+    `UPDATE tasks
+        SET status='running',
+            lease_token=gen_random_uuid(),
+            lease_expires_at=now() + interval '1 minute',
+            lease_heartbeat_at=now()
+      WHERE job_id=$1`,
     [jobId],
   );
 }
@@ -99,7 +101,7 @@ describe("dispatchCpu", () => {
     expect(queue.messages).toEqual([]);
   });
 
-  it("creates exactly one active lease per dispatched task and sets status='queued'", async () => {
+  it("sets lease_token, lease_expires_at, and status='queued' on each dispatched task", async () => {
     const u = await createUser(`${PREFIX}-u`);
     await createJob({ userId: u.id, pipelinesCount: 3 });
 
@@ -108,23 +110,22 @@ describe("dispatchCpu", () => {
 
     expect(queue.messages).toHaveLength(3);
     for (const msg of queue.messages) {
-      const lease = await db.query<{ count: string }>(
-        `SELECT count(*)::text AS count
-           FROM leases
-           WHERE task_id=$1 AND resource='cpu' AND released_at IS NULL`,
-        [msg.taskId],
-      );
-      expect(lease.rows[0].count).toBe("1");
-
-      const task = await db.query<{ status: string }>(
-        `SELECT status FROM tasks WHERE id=$1`,
+      const task = await db.query<{
+        status: string;
+        lease_token: string | null;
+        lease_expires_at: Date | null;
+      }>(
+        `SELECT status, lease_token, lease_expires_at FROM tasks WHERE id=$1`,
         [msg.taskId],
       );
       expect(task.rows[0].status).toBe("queued");
+      expect(task.rows[0].lease_token).toBe(msg.leaseToken);
+      expect(task.rows[0].lease_expires_at).not.toBeNull();
+      expect(task.rows[0].lease_expires_at!.getTime()).toBeGreaterThan(Date.now());
     }
   });
 
-  it("enqueues {taskId, leaseId, attempts} matching the DB rows", async () => {
+  it("enqueues {taskId, leaseToken, attempts} matching the DB rows", async () => {
     const u = await createUser(`${PREFIX}-u`);
     await createJob({ userId: u.id, pipelinesCount: 1 });
 
@@ -134,18 +135,15 @@ describe("dispatchCpu", () => {
     expect(queue.messages).toHaveLength(1);
     const msg = queue.messages[0];
 
-    const task = await db.query<{ id: string; attempts: number }>(
-      `SELECT id, attempts FROM tasks WHERE id=$1`,
+    const task = await db.query<{
+      attempts: number;
+      lease_token: string;
+    }>(
+      `SELECT attempts, lease_token FROM tasks WHERE id=$1`,
       [msg.taskId],
     );
     expect(task.rows[0].attempts).toBe(msg.attempts);
-
-    const lease = await db.query<{ id: string }>(
-      `SELECT id FROM leases
-         WHERE id=$1 AND task_id=$2 AND released_at IS NULL`,
-      [msg.leaseId, msg.taskId],
-    );
-    expect(lease.rowCount).toBe(1);
+    expect(task.rows[0].lease_token).toBe(msg.leaseToken);
   });
 
   it("orders dispatch by (running_cpu_count ASC, jobs.created_at ASC, tasks.created_at ASC)", async () => {
@@ -155,14 +153,12 @@ describe("dispatchCpu", () => {
     const alice = await createUser(`${PREFIX}-alice`);
     const aliceJob = await createJob({ userId: alice.id, pipelinesCount: 2 });
     await db.query(
-      `UPDATE tasks SET status='running'
-         WHERE id = (SELECT id FROM tasks WHERE job_id=$1 LIMIT 1)`,
-      [aliceJob.jobId],
-    );
-    await db.query(
-      `INSERT INTO leases (task_id, user_id, resource, expires_at)
-         SELECT id, user_id, 'cpu', now() + interval '1 minute'
-           FROM tasks WHERE job_id=$1 AND status='running'`,
+      `UPDATE tasks
+          SET status='running',
+              lease_token=gen_random_uuid(),
+              lease_expires_at=now() + interval '1 minute',
+              lease_heartbeat_at=now()
+        WHERE id = (SELECT id FROM tasks WHERE job_id=$1 LIMIT 1)`,
       [aliceJob.jobId],
     );
 
@@ -212,18 +208,15 @@ describe("dispatchCpu", () => {
     queue.shouldThrow = true;
     await expect(dispatchCpu(queue)).rejects.toThrow(/simulated redis/);
 
-    const task = await db.query<{ status: string }>(
-      `SELECT status FROM tasks WHERE user_id=$1`,
+    const task = await db.query<{
+      status: string;
+      lease_token: string | null;
+    }>(
+      `SELECT status, lease_token FROM tasks WHERE user_id=$1`,
       [u.id],
     );
     expect(task.rows[0].status).toBe("queued");
-
-    const lease = await db.query<{ count: string }>(
-      `SELECT count(*)::text AS count
-         FROM leases WHERE user_id=$1 AND released_at IS NULL`,
-      [u.id],
-    );
-    expect(lease.rows[0].count).toBe("1");
+    expect(task.rows[0].lease_token).not.toBeNull();
   });
 
   it("dispatches each pending task at most once across consecutive calls", async () => {
@@ -262,12 +255,12 @@ describe("dispatchCpu — SSH backpressure", () => {
       [u.id],
     );
     expect(queued.rows[0].count).toBe("0");
-    const leases = await db.query<{ count: string }>(
+    const leased = await db.query<{ count: string }>(
       `SELECT count(*)::text AS count
-         FROM leases WHERE user_id=$1 AND released_at IS NULL`,
+         FROM tasks WHERE user_id=$1 AND lease_token IS NOT NULL`,
       [u.id],
     );
-    expect(leases.rows[0].count).toBe("0");
+    expect(leased.rows[0].count).toBe("0");
   });
 
   it("counts pending, queued, and running SSH tasks toward the backlog", async () => {
@@ -338,8 +331,9 @@ describe("dispatchCpu — SSH backpressure", () => {
   });
 
   it("does not gate dispatchSsh on SSH backpressure", async () => {
-    // Running SSH rows count toward backlog but consume no SSH-lease slots
-    // (no lease rows), so dispatchSsh can still drain pending SSH work.
+    // SSH rows in 'running' status without an active lease (lease_token NULL)
+    // count toward the backlog but consume no SSH-lease slots, so dispatchSsh
+    // can still drain pending SSH work.
     const cfg = getConfig();
     const filler = await createUser(`${PREFIX}-bp-ssh-filler`);
     await makeSshTasks(filler.id, cfg.SSH_BACKPRESSURE_THRESHOLD, {
@@ -412,7 +406,7 @@ describe("dispatchSsh", () => {
     expect(queue.messages).toEqual([]);
   });
 
-  it("dispatches all pending SSH tasks under the GLOBAL_SSH_SLOTS cap, marks them queued, creates SSH leases", async () => {
+  it("dispatches all pending SSH tasks under the GLOBAL_SSH_SLOTS cap, marks them queued with a lease_token", async () => {
     const u = await createUser(`${PREFIX}-ssh-u`);
     const jobId = await makeSshTasks(u.id, 3);
 
@@ -429,16 +423,15 @@ describe("dispatchSsh", () => {
     expect(queuedSsh.rows[0].count).toBe("3");
 
     for (const m of queue.messages) {
-      const lease = await db.query<{ count: string }>(
-        `SELECT count(*)::text AS count FROM leases
-           WHERE task_id=$1 AND resource='ssh' AND released_at IS NULL`,
+      const t = await db.query<{ lease_token: string | null }>(
+        `SELECT lease_token FROM tasks WHERE id=$1`,
         [m.taskId],
       );
-      expect(lease.rows[0].count).toBe("1");
+      expect(t.rows[0].lease_token).toBe(m.leaseToken);
     }
   });
 
-  it("uses SSH-resource leases when computing free slots, not CPU leases", async () => {
+  it("uses SSH-kind active leases when computing free slots, not CPU leases", async () => {
     // Saturate CPU resource pool: with 20 CPU leases active, dispatchCpu would
     // refuse, but dispatchSsh must be unaffected.
     const filler = await createUser(`${PREFIX}-ssh-cpu-filler`);
@@ -471,7 +464,7 @@ describe("dispatchTraining", () => {
     expect(queue.messages).toEqual([]);
   });
 
-  it("dispatches pending training tasks, marks them queued, creates training-resource leases", async () => {
+  it("dispatches pending training tasks, marks them queued with a lease_token", async () => {
     const u = await createUser(`${PREFIX}-train-u`);
     const jobA = await makePendingTrainingTask(u.id);
     const jobB = await makePendingTrainingTask(u.id);
@@ -489,16 +482,15 @@ describe("dispatchTraining", () => {
     expect(queuedRows.rows[0].count).toBe("2");
 
     for (const m of queue.messages) {
-      const lease = await db.query<{ count: string }>(
-        `SELECT count(*)::text AS count FROM leases
-           WHERE task_id=$1 AND resource='training' AND released_at IS NULL`,
+      const t = await db.query<{ lease_token: string | null }>(
+        `SELECT lease_token FROM tasks WHERE id=$1`,
         [m.taskId],
       );
-      expect(lease.rows[0].count).toBe("1");
+      expect(t.rows[0].lease_token).toBe(m.leaseToken);
     }
   });
 
-  it("uses TRAINING-resource leases when computing free slots, not CPU leases", async () => {
+  it("uses TRAINING-kind active leases when computing free slots, not CPU leases", async () => {
     const filler = await createUser(`${PREFIX}-train-cpu-filler`);
     await fillActiveCpuLeases(filler.id, 20);
 
@@ -511,33 +503,6 @@ describe("dispatchTraining", () => {
   });
 });
 
-// Forge a queued CPU task with an expired (or about-to-expire) lease, simulating
-// a worker that died mid-flight without releasing.
-async function makeQueuedCpuWithExpiredLease(
-  userId: string,
-  opts: { attempts?: number; maxAttempts?: number } = {},
-): Promise<{ jobId: string; taskId: string; leaseId: string }> {
-  const job = await createJob({ userId, pipelinesCount: 1 });
-  const t = await db.query<{ id: string }>(
-    `SELECT id FROM tasks WHERE job_id=$1 LIMIT 1`,
-    [job.jobId],
-  );
-  const taskId = t.rows[0].id;
-  await db.query(
-    `UPDATE tasks
-        SET status='queued', attempts=$2, max_attempts=$3
-      WHERE id=$1`,
-    [taskId, opts.attempts ?? 0, opts.maxAttempts ?? 3],
-  );
-  const lease = await db.query<{ id: string }>(
-    `INSERT INTO leases (task_id, user_id, resource, expires_at)
-       VALUES ($1, $2, 'cpu', now() - interval '1 second')
-       RETURNING id`,
-    [taskId, userId],
-  );
-  return { jobId: job.jobId, taskId, leaseId: lease.rows[0].id };
-}
-
 describe("reapExpiredLeases", () => {
   it("returns 0 and does nothing when no leases are expired", async () => {
     const u = await createUser(`${PREFIX}-reap-noop`);
@@ -546,25 +511,29 @@ describe("reapExpiredLeases", () => {
       `SELECT id FROM tasks WHERE job_id=$1 LIMIT 1`,
       [job.jobId],
     );
-    await db.query(`UPDATE tasks SET status='queued' WHERE id=$1`, [t.rows[0].id]);
     await db.query(
-      `INSERT INTO leases (task_id, user_id, resource, expires_at)
-         VALUES ($1, $2, 'cpu', now() + interval '1 minute')`,
-      [t.rows[0].id, u.id],
+      `UPDATE tasks
+          SET status='queued',
+              lease_token=gen_random_uuid(),
+              lease_expires_at=now() + interval '1 minute',
+              lease_heartbeat_at=now()
+        WHERE id=$1`,
+      [t.rows[0].id],
     );
 
     expect(await reapExpiredLeases()).toBe(0);
 
-    const row = await db.query<{ status: string }>(
-      `SELECT status FROM tasks WHERE id=$1`,
+    const row = await db.query<{ status: string; lease_token: string | null }>(
+      `SELECT status, lease_token FROM tasks WHERE id=$1`,
       [t.rows[0].id],
     );
     expect(row.rows[0].status).toBe("queued");
+    expect(row.rows[0].lease_token).not.toBeNull();
   });
 
-  it("resets a retryable expired task to 'pending' and releases the lease", async () => {
+  it("resets a retryable expired task to 'pending' and clears the lease columns", async () => {
     const u = await createUser(`${PREFIX}-reap-retry`);
-    const fx = await makeQueuedCpuWithExpiredLease(u.id, {
+    const fx = await makeQueuedCpuTaskWithExpiredLease(u.id, {
       attempts: 1,
       maxAttempts: 3,
     });
@@ -576,25 +545,27 @@ describe("reapExpiredLeases", () => {
       status: string;
       attempts: number;
       started_at: Date | null;
-    }>(`SELECT status, attempts, started_at FROM tasks WHERE id=$1`, [
-      fx.taskId,
-    ]);
+      lease_token: string | null;
+      lease_expires_at: Date | null;
+      lease_heartbeat_at: Date | null;
+    }>(
+      `SELECT status, attempts, started_at, lease_token, lease_expires_at, lease_heartbeat_at
+         FROM tasks WHERE id=$1`,
+      [fx.taskId],
+    );
     expect(task.rows[0].status).toBe("pending");
     // attempts is NOT bumped by the reaper — the next worker's claimTask bumps
     // it. Bumping here would double-count attempts.
     expect(task.rows[0].attempts).toBe(1);
     expect(task.rows[0].started_at).toBeNull();
-
-    const lease = await db.query<{ released_at: Date | null }>(
-      `SELECT released_at FROM leases WHERE id=$1`,
-      [fx.leaseId],
-    );
-    expect(lease.rows[0].released_at).not.toBeNull();
+    expect(task.rows[0].lease_token).toBeNull();
+    expect(task.rows[0].lease_expires_at).toBeNull();
+    expect(task.rows[0].lease_heartbeat_at).toBeNull();
   });
 
   it("marks a task 'failed' when attempts >= max_attempts and propagates job failure", async () => {
     const u = await createUser(`${PREFIX}-reap-perm-fail`);
-    const fx = await makeQueuedCpuWithExpiredLease(u.id, {
+    const fx = await makeQueuedCpuTaskWithExpiredLease(u.id, {
       attempts: 3,
       maxAttempts: 3,
     });
@@ -605,13 +576,15 @@ describe("reapExpiredLeases", () => {
       status: string;
       failure_reason: string | null;
       finished_at: Date | null;
+      lease_token: string | null;
     }>(
-      `SELECT status, failure_reason, finished_at FROM tasks WHERE id=$1`,
+      `SELECT status, failure_reason, finished_at, lease_token FROM tasks WHERE id=$1`,
       [fx.taskId],
     );
     expect(task.rows[0].status).toBe("failed");
     expect(task.rows[0].failure_reason).toBe("lease_expired");
     expect(task.rows[0].finished_at).not.toBeNull();
+    expect(task.rows[0].lease_token).toBeNull();
 
     const job = await db.query<{ status: string; completed_at: Date | null }>(
       `SELECT status, completed_at FROM jobs WHERE id=$1`,
@@ -619,21 +592,20 @@ describe("reapExpiredLeases", () => {
     );
     expect(job.rows[0].status).toBe("failed");
     expect(job.rows[0].completed_at).not.toBeNull();
-
-    const lease = await db.query<{ released_at: Date | null }>(
-      `SELECT released_at FROM leases WHERE id=$1`,
-      [fx.leaseId],
-    );
-    expect(lease.rows[0].released_at).not.toBeNull();
   });
 
-  it("does not touch leases that are already released", async () => {
+  it("does not touch tasks whose lease has already been released", async () => {
     const u = await createUser(`${PREFIX}-reap-released`);
-    const fx = await makeQueuedCpuWithExpiredLease(u.id);
-    await db.query(`UPDATE leases SET released_at=now() WHERE id=$1`, [
-      fx.leaseId,
-    ]);
-    // Task is left in 'queued' on purpose; reaper must not touch it.
+    const fx = await makeQueuedCpuTaskWithExpiredLease(u.id);
+    // Simulate finalize having released the lease (lease columns cleared).
+    // Status is left in 'queued' on purpose; reaper must not touch it because
+    // there is no expired lease_expires_at to detect.
+    await db.query(
+      `UPDATE tasks
+          SET lease_token=NULL, lease_expires_at=NULL, lease_heartbeat_at=NULL
+        WHERE id=$1`,
+      [fx.taskId],
+    );
     expect(await reapExpiredLeases()).toBe(0);
 
     const task = await db.query<{ status: string }>(
@@ -649,7 +621,7 @@ describe("reapExpiredLeases", () => {
     // 'pending'), so the dispatch count below tests slot recovery cleanly.
     const filler = await createUser(`${PREFIX}-reap-slot`);
     for (let i = 0; i < 20; i++) {
-      await makeQueuedCpuWithExpiredLease(filler.id, {
+      await makeQueuedCpuTaskWithExpiredLease(filler.id, {
         attempts: 3,
         maxAttempts: 3,
       });

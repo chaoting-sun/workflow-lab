@@ -5,7 +5,8 @@ import type { DispatchMessage, DispatchQueue } from "./scheduler";
 
 // One BullMQ queue per task kind. Same payload shape on all three; the kind
 // is implicit in the queue. BullMQ is delivery-only — no priorities, no
-// BullMQ retries (failure recovery flows through tasks.attempts + leases).
+// BullMQ retries (failure recovery flows through tasks.attempts + the
+// lease columns on tasks).
 
 const JOB_NAME = "task";
 

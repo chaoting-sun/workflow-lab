@@ -41,7 +41,7 @@ describe("claimTask", () => {
 
     const msg: WorkerTaskMessage = {
       taskId: fx.taskId,
-      leaseId: fx.leaseId,
+      leaseToken: fx.leaseToken,
       attempts: fx.attempts,
     };
     const claimed = await claimTask(msg);
@@ -71,7 +71,7 @@ describe("claimTask", () => {
 
     const claimed = await claimTask({
       taskId: fx.taskId,
-      leaseId: fx.leaseId,
+      leaseToken: fx.leaseToken,
       attempts: fx.attempts,
     });
     expect(claimed).not.toBeNull();
@@ -93,7 +93,7 @@ describe("claimTask", () => {
 
     await claimTask({
       taskId: fx.taskId,
-      leaseId: fx.leaseId,
+      leaseToken: fx.leaseToken,
       attempts: fx.attempts,
     });
 
@@ -111,7 +111,7 @@ describe("claimTask", () => {
 
     const claimed = await claimTask({
       taskId: fx.taskId,
-      leaseId: fx.leaseId,
+      leaseToken: fx.leaseToken,
       attempts: fx.attempts,
     });
     expect(claimed).toBeNull();
@@ -130,7 +130,7 @@ describe("claimTask", () => {
 
     const claimed = await claimTask({
       taskId: fx.taskId,
-      leaseId: fx.leaseId,
+      leaseToken: fx.leaseToken,
       attempts: fx.attempts + 99,
     });
     expect(claimed).toBeNull();
@@ -143,26 +143,31 @@ describe("claimTask", () => {
     expect(row.rows[0].attempts).toBe(fx.attempts);
   });
 
-  it("returns null when the lease has been released", async () => {
+  it("returns null when the lease has been released (lease_token NULLed)", async () => {
     const u = await createUser(`${PREFIX}-claim-lease-released`);
     const fx = await makeQueuedCpuTaskWithLease(u.id);
-    await db.query(`UPDATE leases SET released_at=now() WHERE id=$1`, [fx.leaseId]);
+    await db.query(
+      `UPDATE tasks
+          SET lease_token=NULL, lease_expires_at=NULL, lease_heartbeat_at=NULL
+        WHERE id=$1`,
+      [fx.taskId],
+    );
 
     const claimed = await claimTask({
       taskId: fx.taskId,
-      leaseId: fx.leaseId,
+      leaseToken: fx.leaseToken,
       attempts: fx.attempts,
     });
     expect(claimed).toBeNull();
   });
 
-  it("returns null when the leaseId does not match the task", async () => {
+  it("returns null when the leaseToken does not match the task", async () => {
     const u = await createUser(`${PREFIX}-claim-wrong-lease`);
     const fx = await makeQueuedCpuTaskWithLease(u.id);
 
     const claimed = await claimTask({
       taskId: fx.taskId,
-      leaseId: "00000000-0000-0000-0000-000000000000",
+      leaseToken: "00000000-0000-0000-0000-000000000000",
       attempts: fx.attempts,
     });
     expect(claimed).toBeNull();
@@ -173,38 +178,42 @@ describe("finalizeCpuSuccess", () => {
   async function claim(fx: QueuedTaskFixture): Promise<ClaimedTask> {
     const c = await claimTask({
       taskId: fx.taskId,
-      leaseId: fx.leaseId,
+      leaseToken: fx.leaseToken,
       attempts: fx.attempts,
     });
     if (!c) throw new Error("setup: claim failed");
     return c;
   }
 
-  it("marks task succeeded, inserts artifact, releases lease, and creates SSH child", async () => {
+  it("marks task succeeded, inserts artifact, clears lease columns, and creates SSH child", async () => {
     const u = await createUser(`${PREFIX}-fin-ok`);
     const fx = await makeQueuedCpuTaskWithLease(u.id);
     const claimed = await claim(fx);
 
-    await finalizeCpuSuccess(claimed, fx.leaseId, "/tmp/cpu-artifact.txt");
+    await finalizeCpuSuccess(claimed, "/tmp/cpu-artifact.txt");
 
-    const task = await db.query<{ status: string; finished_at: Date }>(
-      `SELECT status, finished_at FROM tasks WHERE id=$1`,
+    const task = await db.query<{
+      status: string;
+      finished_at: Date;
+      lease_token: string | null;
+      lease_expires_at: Date | null;
+      lease_heartbeat_at: Date | null;
+    }>(
+      `SELECT status, finished_at, lease_token, lease_expires_at, lease_heartbeat_at
+         FROM tasks WHERE id=$1`,
       [fx.taskId],
     );
     expect(task.rows[0].status).toBe("succeeded");
     expect(task.rows[0].finished_at).not.toBeNull();
+    expect(task.rows[0].lease_token).toBeNull();
+    expect(task.rows[0].lease_expires_at).toBeNull();
+    expect(task.rows[0].lease_heartbeat_at).toBeNull();
 
     const artifact = await db.query<{ count: string }>(
       `SELECT count(*)::text AS count FROM artifacts WHERE task_id=$1`,
       [fx.taskId],
     );
     expect(artifact.rows[0].count).toBe("1");
-
-    const lease = await db.query<{ released_at: Date | null }>(
-      `SELECT released_at FROM leases WHERE id=$1`,
-      [fx.leaseId],
-    );
-    expect(lease.rows[0].released_at).not.toBeNull();
 
     const child = await db.query<{
       id: string;
@@ -237,28 +246,27 @@ describe("finalizeCpuSuccess", () => {
     await db.query(`UPDATE tasks SET attempts=attempts+1 WHERE id=$1`, [fx.taskId]);
 
     await expect(
-      finalizeCpuSuccess(claimed, fx.leaseId, "/tmp/cpu-artifact.txt"),
+      finalizeCpuSuccess(claimed, "/tmp/cpu-artifact.txt"),
     ).rejects.toBeInstanceOf(StaleAttemptError);
 
-    const task = await db.query<{ status: string }>(
-      `SELECT status FROM tasks WHERE id=$1`,
+    const task = await db.query<{
+      status: string;
+      lease_token: string | null;
+    }>(
+      `SELECT status, lease_token FROM tasks WHERE id=$1`,
       [fx.taskId],
     );
     // Status should still be 'running' (or whatever the racing actor set);
-    // crucially, it must NOT be 'succeeded'.
+    // crucially, it must NOT be 'succeeded'. The lease must remain live so
+    // the reaper / next claim can carry the task forward.
     expect(task.rows[0].status).not.toBe("succeeded");
+    expect(task.rows[0].lease_token).not.toBeNull();
 
     const artifact = await db.query<{ count: string }>(
       `SELECT count(*)::text AS count FROM artifacts WHERE task_id=$1`,
       [fx.taskId],
     );
     expect(artifact.rows[0].count).toBe("0");
-
-    const lease = await db.query<{ released_at: Date | null }>(
-      `SELECT released_at FROM leases WHERE id=$1`,
-      [fx.leaseId],
-    );
-    expect(lease.rows[0].released_at).toBeNull();
 
     const child = await db.query<{ count: string }>(
       `SELECT count(*)::text AS count FROM tasks WHERE parent_task_id=$1`,
@@ -279,7 +287,7 @@ describe("finalizeCpuSuccess", () => {
       [fx.jobId, fx.userId, fx.taskId],
     );
 
-    await finalizeCpuSuccess(claimed, fx.leaseId, "/tmp/cpu-artifact.txt");
+    await finalizeCpuSuccess(claimed, "/tmp/cpu-artifact.txt");
 
     const child = await db.query<{ count: string }>(
       `SELECT count(*)::text AS count FROM tasks
@@ -294,20 +302,20 @@ describe("finalizeTaskFailure", () => {
   async function claim(fx: QueuedTaskFixture): Promise<ClaimedTask> {
     const c = await claimTask({
       taskId: fx.taskId,
-      leaseId: fx.leaseId,
+      leaseToken: fx.leaseToken,
       attempts: fx.attempts,
     });
     if (!c) throw new Error("setup: claim failed");
     return c;
   }
 
-  it("retryable (attempts < max_attempts): resets task to pending, sets failure_reason, releases lease, leaves job unfailed", async () => {
+  it("retryable (attempts < max_attempts): resets task to pending, sets failure_reason, clears lease, leaves job unfailed", async () => {
     const u = await createUser(`${PREFIX}-fail-retry`);
     const fx = await makeQueuedCpuTaskWithLease(u.id);
     // max_attempts default = 3; first claim brings attempts to 1.
     const claimed = await claim(fx);
 
-    const ok = await finalizeTaskFailure(claimed, fx.leaseId, "timeout");
+    const ok = await finalizeTaskFailure(claimed, "timeout");
     expect(ok).toBe(true);
 
     const task = await db.query<{
@@ -316,8 +324,11 @@ describe("finalizeTaskFailure", () => {
       finished_at: Date | null;
       started_at: Date | null;
       attempts: number;
+      lease_token: string | null;
+      lease_expires_at: Date | null;
     }>(
-      `SELECT status, failure_reason, finished_at, started_at, attempts
+      `SELECT status, failure_reason, finished_at, started_at, attempts,
+              lease_token, lease_expires_at
          FROM tasks WHERE id=$1`,
       [fx.taskId],
     );
@@ -325,16 +336,12 @@ describe("finalizeTaskFailure", () => {
     expect(task.rows[0].failure_reason).toBe("timeout");
     expect(task.rows[0].finished_at).toBeNull();
     expect(task.rows[0].started_at).toBeNull();
+    expect(task.rows[0].lease_token).toBeNull();
+    expect(task.rows[0].lease_expires_at).toBeNull();
     // attempts is bumped by claimTask, NOT reset on retry — the worker that
     // re-claims it will bump it again. The reaper-style retry path elsewhere
     // matches this behaviour.
     expect(task.rows[0].attempts).toBe(fx.attempts + 1);
-
-    const lease = await db.query<{ released_at: Date | null }>(
-      `SELECT released_at FROM leases WHERE id=$1`,
-      [fx.leaseId],
-    );
-    expect(lease.rows[0].released_at).not.toBeNull();
 
     const job = await db.query<{ status: string }>(
       `SELECT status FROM jobs WHERE id=$1`,
@@ -345,7 +352,7 @@ describe("finalizeTaskFailure", () => {
     expect(job.rows[0].status).not.toBe("failed");
   });
 
-  it("non-retryable (attempts >= max_attempts): marks task failed, sets finished_at, releases lease, fails the job", async () => {
+  it("non-retryable (attempts >= max_attempts): marks task failed, sets finished_at, clears lease, fails the job", async () => {
     const u = await createUser(`${PREFIX}-fail-final`);
     const fx = await makeQueuedCpuTaskWithLease(u.id);
     // Force the task to be on its last legal attempt: max_attempts=1 means
@@ -353,26 +360,22 @@ describe("finalizeTaskFailure", () => {
     await db.query(`UPDATE tasks SET max_attempts=1 WHERE id=$1`, [fx.taskId]);
     const claimed = await claim(fx);
 
-    const ok = await finalizeTaskFailure(claimed, fx.leaseId, "timeout");
+    const ok = await finalizeTaskFailure(claimed, "timeout");
     expect(ok).toBe(true);
 
     const task = await db.query<{
       status: string;
       failure_reason: string | null;
       finished_at: Date | null;
+      lease_token: string | null;
     }>(
-      `SELECT status, failure_reason, finished_at FROM tasks WHERE id=$1`,
+      `SELECT status, failure_reason, finished_at, lease_token FROM tasks WHERE id=$1`,
       [fx.taskId],
     );
     expect(task.rows[0].status).toBe("failed");
     expect(task.rows[0].failure_reason).toBe("timeout");
     expect(task.rows[0].finished_at).not.toBeNull();
-
-    const lease = await db.query<{ released_at: Date | null }>(
-      `SELECT released_at FROM leases WHERE id=$1`,
-      [fx.leaseId],
-    );
-    expect(lease.rows[0].released_at).not.toBeNull();
+    expect(task.rows[0].lease_token).toBeNull();
 
     const job = await db.query<{ status: string }>(
       `SELECT status FROM jobs WHERE id=$1`,
@@ -389,81 +392,87 @@ describe("finalizeTaskFailure", () => {
     // Simulate a concurrent reaper bumping attempts behind us.
     await db.query(`UPDATE tasks SET attempts=attempts+1 WHERE id=$1`, [fx.taskId]);
 
-    const ok = await finalizeTaskFailure(claimed, fx.leaseId, "timeout");
+    const ok = await finalizeTaskFailure(claimed, "timeout");
     expect(ok).toBe(false);
 
     const task = await db.query<{
       status: string;
       failure_reason: string | null;
+      lease_token: string | null;
     }>(
-      `SELECT status, failure_reason FROM tasks WHERE id=$1`,
+      `SELECT status, failure_reason, lease_token FROM tasks WHERE id=$1`,
       [fx.taskId],
     );
-    // The stale-claim path must not flip status nor stamp a reason.
+    // The stale-claim path must not flip status nor stamp a reason nor clear
+    // the lease.
     expect(task.rows[0].status).not.toBe("failed");
     expect(task.rows[0].status).not.toBe("pending");
     expect(task.rows[0].failure_reason).toBeNull();
-
-    const lease = await db.query<{ released_at: Date | null }>(
-      `SELECT released_at FROM leases WHERE id=$1`,
-      [fx.leaseId],
-    );
-    expect(lease.rows[0].released_at).toBeNull();
+    expect(task.rows[0].lease_token).not.toBeNull();
   });
 
-  it("does not double-release a lease that was already released", async () => {
-    const u = await createUser(`${PREFIX}-fail-released-lease`);
+  it("is a no-op if status is no longer 'running' (idempotent on second call)", async () => {
+    const u = await createUser(`${PREFIX}-fail-idempotent`);
     const fx = await makeQueuedCpuTaskWithLease(u.id);
     const claimed = await claim(fx);
 
-    const before = await db.query<{ released_at: Date }>(
-      `UPDATE leases SET released_at=now() WHERE id=$1 RETURNING released_at`,
-      [fx.leaseId],
-    );
-    const releasedAt = before.rows[0].released_at;
+    const first = await finalizeTaskFailure(claimed, "timeout");
+    expect(first).toBe(true);
 
-    await finalizeTaskFailure(claimed, fx.leaseId, "timeout");
-
-    const lease = await db.query<{ released_at: Date }>(
-      `SELECT released_at FROM leases WHERE id=$1`,
-      [fx.leaseId],
+    const afterFirst = await db.query<{ status: string; failure_reason: string }>(
+      `SELECT status, failure_reason FROM tasks WHERE id=$1`,
+      [fx.taskId],
     );
-    expect(lease.rows[0].released_at.getTime()).toBe(releasedAt.getTime());
+
+    const second = await finalizeTaskFailure(claimed, "different_reason");
+    // Second call hits the optimistic guard (status no longer 'running') and
+    // is a no-op — failure_reason from the first call is preserved.
+    expect(second).toBe(false);
+    const afterSecond = await db.query<{ status: string; failure_reason: string }>(
+      `SELECT status, failure_reason FROM tasks WHERE id=$1`,
+      [fx.taskId],
+    );
+    expect(afterSecond.rows[0].status).toBe(afterFirst.rows[0].status);
+    expect(afterSecond.rows[0].failure_reason).toBe(afterFirst.rows[0].failure_reason);
   });
 });
 
 describe("startHeartbeat", () => {
-  async function getLeaseTimes(leaseId: string): Promise<{
-    heartbeat_at: Date;
-    expires_at: Date;
-    released_at: Date | null;
+  async function getTaskLease(taskId: string): Promise<{
+    lease_heartbeat_at: Date | null;
+    lease_expires_at: Date | null;
+    lease_token: string | null;
   }> {
     const { rows } = await db.query<{
-      heartbeat_at: Date;
-      expires_at: Date;
-      released_at: Date | null;
+      lease_heartbeat_at: Date | null;
+      lease_expires_at: Date | null;
+      lease_token: string | null;
     }>(
-      `SELECT heartbeat_at, expires_at, released_at FROM leases WHERE id=$1`,
-      [leaseId],
+      `SELECT lease_heartbeat_at, lease_expires_at, lease_token
+         FROM tasks WHERE id=$1`,
+      [taskId],
     );
     return rows[0];
   }
 
-  it("bumps heartbeat_at and expires_at on each tick while running", async () => {
+  it("bumps lease_heartbeat_at and lease_expires_at on each tick while running", async () => {
     const u = await createUser(`${PREFIX}-hb-bump`);
     const fx = await makeQueuedCpuTaskWithLease(u.id);
-    const before = await getLeaseTimes(fx.leaseId);
+    const before = await getTaskLease(fx.taskId);
 
-    const hb = startHeartbeat(fx.leaseId, { intervalMs: 30, ttlMs: 60_000 });
+    const hb = startHeartbeat(fx.taskId, fx.leaseToken, {
+      intervalMs: 30,
+      ttlMs: 60_000,
+    });
     await new Promise((r) => setTimeout(r, 120));
     hb.stop();
 
-    const after = await getLeaseTimes(fx.leaseId);
-    expect(after.heartbeat_at.getTime()).toBeGreaterThan(
-      before.heartbeat_at.getTime(),
+    const after = await getTaskLease(fx.taskId);
+    expect(after.lease_heartbeat_at!.getTime()).toBeGreaterThan(
+      before.lease_heartbeat_at!.getTime(),
     );
-    expect(after.expires_at.getTime()).toBeGreaterThan(
-      before.expires_at.getTime(),
+    expect(after.lease_expires_at!.getTime()).toBeGreaterThan(
+      before.lease_expires_at!.getTime(),
     );
   });
 
@@ -471,30 +480,44 @@ describe("startHeartbeat", () => {
     const u = await createUser(`${PREFIX}-hb-stop`);
     const fx = await makeQueuedCpuTaskWithLease(u.id);
 
-    const hb = startHeartbeat(fx.leaseId, { intervalMs: 30, ttlMs: 60_000 });
+    const hb = startHeartbeat(fx.taskId, fx.leaseToken, {
+      intervalMs: 30,
+      ttlMs: 60_000,
+    });
     await new Promise((r) => setTimeout(r, 80));
     hb.stop();
-    const afterStop = await getLeaseTimes(fx.leaseId);
+    const afterStop = await getTaskLease(fx.taskId);
 
     await new Promise((r) => setTimeout(r, 120));
-    const later = await getLeaseTimes(fx.leaseId);
+    const later = await getTaskLease(fx.taskId);
 
-    expect(later.heartbeat_at.getTime()).toBe(afterStop.heartbeat_at.getTime());
-    expect(later.expires_at.getTime()).toBe(afterStop.expires_at.getTime());
+    expect(later.lease_heartbeat_at!.getTime()).toBe(
+      afterStop.lease_heartbeat_at!.getTime(),
+    );
+    expect(later.lease_expires_at!.getTime()).toBe(
+      afterStop.lease_expires_at!.getTime(),
+    );
   });
 
   it("does not resurrect a released lease", async () => {
     const u = await createUser(`${PREFIX}-hb-released`);
     const fx = await makeQueuedCpuTaskWithLease(u.id);
-    await db.query(`UPDATE leases SET released_at=now() WHERE id=$1`, [
-      fx.leaseId,
-    ]);
+    await db.query(
+      `UPDATE tasks
+          SET lease_token=NULL, lease_expires_at=NULL, lease_heartbeat_at=NULL
+        WHERE id=$1`,
+      [fx.taskId],
+    );
 
-    const hb = startHeartbeat(fx.leaseId, { intervalMs: 20, ttlMs: 60_000 });
+    const hb = startHeartbeat(fx.taskId, fx.leaseToken, {
+      intervalMs: 20,
+      ttlMs: 60_000,
+    });
     await new Promise((r) => setTimeout(r, 80));
     hb.stop();
 
-    const row = await getLeaseTimes(fx.leaseId);
-    expect(row.released_at).not.toBeNull();
+    const row = await getTaskLease(fx.taskId);
+    expect(row.lease_token).toBeNull();
+    expect(row.lease_expires_at).toBeNull();
   });
 });
