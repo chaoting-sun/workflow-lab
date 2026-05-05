@@ -172,20 +172,20 @@ DB owns policy and state. BullMQ is a transport that announces "this specific ta
 
 ```mermaid
 flowchart LR
-    API[POST /jobs] -->|insert job + N pending tasks| DB[(Postgres<br/>SOURCE OF TRUTH<br/>tasks, leases, artifacts)]
+    API[POST /jobs] -->|insert job + N pending tasks| DB[(Postgres<br/>SOURCE OF TRUTH<br/>tasks + lease columns, artifacts)]
 
     subgraph WorkerProc["Worker process"]
         Sched{{"Scheduler tick (1s)<br/>fairness + reaper"}}
         W1[BullMQ Worker]
     end
 
-    Sched -->|"reap expired leases<br/>create lease<br/>mark task queued"| DB
-    Sched -->|"enqueue {taskId, leaseId, attempts}"| Q[(Redis + BullMQ<br/>delivery only)]
+    Sched -->|"reap expired leases<br/>set lease_token + lease_expires_at<br/>mark task queued"| DB
+    Sched -->|"enqueue {taskId, leaseToken, attempts}"| Q[(Redis + BullMQ<br/>delivery only)]
     Q --> W1
-    W1 -->|"atomic claim<br/>(taskId + leaseId + attempts)"| DB
-    W1 -->|"heartbeat lease"| DB
+    W1 -->|"atomic claim<br/>(taskId + leaseToken + attempts)"| DB
+    W1 -->|"heartbeat (bump lease_expires_at)"| DB
     W1 -.write artifact.-> FS[/disk/]
-    W1 -->|"finalize: status + artifact + release lease"| DB
+    W1 -->|"finalize: status + artifact + clear lease columns"| DB
 
     classDef store fill:#fef3c7,stroke:#d97706
     classDef policy fill:#dbeafe,stroke:#2563eb
@@ -195,11 +195,11 @@ flowchart LR
 
 ### Fairness
 
-Identical SQL to Option B — same correlated-subquery rank, same `FOR UPDATE SKIP LOCKED`, same single-tx Count + Rank + Reserve. BullMQ does not see the `tasks` table, does not influence rank, does not hold counters. It is fully transparent to fairness.
+Same correlated-subquery rank as Option B and same `FOR UPDATE SKIP LOCKED`, but the lease lives on the task row itself: per ADR-0001, Count + Rank + Reserve collapses into a single UPDATE on `tasks` (no `INSERT lease`). Slot accounting reads `count(*) FROM tasks WHERE kind=$1 AND lease_token IS NOT NULL`. BullMQ does not see the `tasks` table, does not influence rank, does not hold counters. It is fully transparent to fairness.
 
 The single-instance scheduler invariant (Postgres advisory lock) makes Count + Rank + Reserve a single-writer operation, eliminating scheduler-vs-scheduler races.
 
-The only fairness-side concern is the crash window: scheduler dies after `COMMIT lease` but before `bullmq.add` → that user's `running_count` is briefly inflated until the lease reaper recovers it. Bounded by `LEASE_TTL_MS`.
+The only fairness-side concern is the crash window: scheduler dies after the reserve UPDATE commits but before `bullmq.add` → that user's `running_count` is briefly inflated until the lease reaper recovers it. Bounded by `LEASE_TTL_MS`.
 
 ### Other pros / cons
 
@@ -219,10 +219,10 @@ The only fairness-side concern is the crash window: scheduler dies after `COMMIT
 
 | Capability | A: BullMQ | B: PG only | C: pg-boss / Graphile | D: PG truth + BullMQ |
 |---|---|---|---|---|
-| Live `running_count` per user | ❌ static priority | ✅ `count(leases)` | ✅ same as B | ✅ same as B |
+| Live `running_count` per user | ❌ static priority | ✅ `count(leases)` | ✅ same as B | ✅ `count(tasks WHERE lease_token IS NOT NULL)` |
 | Multi-key rank `(running_count, job_age, task_age)` | ❌ one-dimensional | ✅ SQL ORDER BY | ✅ | ✅ |
-| Atomic Count + Rank + Reserve | ❌ | ✅ single tx | ✅ | ✅ |
-| Slot pools (global + per-kind) | ❌ DIY | ✅ `count(leases)` | ✅ | ✅ |
+| Atomic Count + Rank + Reserve | ❌ | ✅ single tx | ✅ | ✅ single UPDATE |
+| Slot pools (global + per-kind) | ❌ DIY | ✅ `count(leases)` | ✅ | ✅ `count(tasks)` on lease columns |
 | Cross-kind backpressure (CPU paused on SSH backlog) | ❌ no global view | ✅ one query | ✅ | ✅ |
 | Adding new fairness rules later | ❌ rebuild | ✅ SQL edit | ✅ | ✅ |
 | Worker pickup latency | low | medium (poll/LISTEN) | medium | low |

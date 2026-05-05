@@ -6,21 +6,21 @@ This doc captures how `tasks.status` transitions are produced, which writers tou
 
 | From → To           | Writer                                          | Touches `attempts`? |
 | ------------------- | ----------------------------------------------- | ------------------- |
-| pending → queued    | `reserveOneTask` (`lib/scheduler.ts:82`)        | No                  |
-| queued  → running   | `claimTaskForRun` (`lib/worker.ts:110`)         | **Yes (+1)**        |
-| running → succeeded | `finalize*Success` (`lib/worker.ts:148`, `:188`, `:293`) | No         |
-| running → pending   | `finalizeTaskFailure` retryable arm (`lib/worker.ts:225`) | No        |
-| running → failed    | `finalizeTaskFailure` terminal arm (`lib/worker.ts:225`)  | No        |
-| running → pending   | `reapExpiredLeases` (`lib/scheduler.ts:174`)    | **No (by design)**  |
+| pending → queued    | `reserveOneTask` (`lib/scheduler.ts:29`)        | No                  |
+| queued  → running   | `claimTask` (`lib/worker.ts:95`)                | **Yes (+1)**        |
+| running → succeeded | `finalize*Success` (`lib/worker.ts:150`, `:179`, `:269`) | No         |
+| running → pending   | `finalizeTaskFailure` retryable arm (`lib/worker.ts:203`) | No        |
+| running → failed    | `finalizeTaskFailure` terminal arm (`lib/worker.ts:203`)  | No        |
+| running → pending   | `reapExpiredLeases` (`lib/scheduler.ts:146`)    | **No (by design)**  |
 | running → queued    | **No direct writer. Two-step path only.**       | —                   |
 
 ## Invariant: `attempts` is incremented only by the claim
 
-Reaper deliberately does NOT bump `attempts` (`lib/scheduler.ts:145-148`). The rationale, kept in code comments at that site:
+Reaper deliberately does NOT bump `attempts` (`lib/scheduler.ts:139-142`). The rationale, kept in code comments at that site:
 
-> A worker that briefly stalls past lease TTL but still finalizes successfully would otherwise be charged an extra attempt against `max_attempts`. The next `claimTaskForRun` is the single point where attempts increase.
+> A worker that briefly stalls past lease TTL but still finalizes successfully would otherwise be charged an extra attempt against `max_attempts`. The next `claimTask` is the single point where attempts increase.
 
-This is the diagnostic fingerprint for the rest of this doc: if you see a status flip with `attempts` unchanged, it cannot have gone through `claimTaskForRun`.
+This is the diagnostic fingerprint for the rest of this doc: if you see a status flip with `attempts` unchanged, it cannot have gone through `claimTask`.
 
 ## The "running → queued" puzzle
 
@@ -35,8 +35,8 @@ running  ──reap───────►  pending  ──dispatch──►  q
           attempts unchanged)
 ```
 
-- **Step 1 (reap).** `reapExpiredLeases` (`lib/scheduler.ts:152`) selects leases where `released_at IS NULL AND expires_at < now()`, sets the task to `pending`, releases the old lease. Heartbeats normally keep `expires_at` ahead of `now()`, but a stalled heartbeat (DB blip, event-loop pause, chained `tick` blocked on a slow `UPDATE leases`) will let it slip.
-- **Step 2 (dispatch).** The same scheduler tick (or a subsequent one) runs `dispatchKind` → `reserveOneTask`, which selects on `status='pending'` and writes `status='queued'` plus a fresh lease row.
+- **Step 1 (reap).** `reapExpiredLeases` (`lib/scheduler.ts:146`) selects tasks where `lease_expires_at < now() AND status IN ('queued','running')`, sets the task to `pending`, and clears the lease columns (`lease_token`, `lease_expires_at`, `lease_heartbeat_at`). Heartbeats normally keep `lease_expires_at` ahead of `now()`, but a stalled heartbeat (DB blip, event-loop pause, chained tick blocked on a slow `UPDATE`) will let it slip.
+- **Step 2 (dispatch).** The same scheduler tick (or a subsequent one) runs `dispatchKind` → `reserveOneTask`, which selects on `status='pending'` and writes `status='queued'` plus a fresh `lease_token` / `lease_expires_at` / `lease_heartbeat_at` in the same UPDATE.
 
 Both writes preserve `attempts`, so the row's `attempts` value is the same as before the cycle.
 
@@ -47,7 +47,7 @@ The dispatch step (`reserveOneTask`) requires a live worker process running the 
 1. **Final tick during graceful shutdown.** `worker/index.ts:90-107` runs `await loop.stop()` first. `loop.stop()` clears the next-tick timer but **awaits the in-flight tick** so it can finish its `reapExpiredLeases` + parallel `dispatchKind` work. If a heartbeat had stalled long enough for a lease to expire, this final tick reaps the task to `pending` and dispatches it back to `queued` before shutdown progresses.
 2. **Restart inside the lease TTL window.** If the worker is killed (graceful or hard), heartbeats stop, and a fresh worker boots before any external observer queries, the new worker's first tick reaps the orphaned lease (`status='running'` from the previous process), flips it to `pending`, then dispatches to `queued` — same two-step path, just spanning a process boundary.
 
-The two scenarios are indistinguishable from the `tasks` row alone; the `leases` table tells them apart (see Diagnostics below).
+The two scenarios are indistinguishable from the current `tasks` row alone — and after ADR-0001 the row no longer keeps the per-attempt lease history that used to disambiguate them. See Diagnostics below for what can still be inferred and where logs become the source of truth.
 
 ## Graceful shutdown contract
 
@@ -67,24 +67,23 @@ What the shutdown path does **not** currently do:
 
 ## Diagnostics
 
-To confirm a `running → queued` event came through the reap path, query both tables:
+After ADR-0001 (lease columns merged into `tasks`), each fresh dispatch overwrites the previous `lease_token` / `lease_expires_at` / `lease_heartbeat_at` — there is no longer a per-attempt lease history persisted on the row. The single-row fingerprint is therefore weaker than it used to be: from `tasks` alone, a `(running → queued)` flip cannot be definitively attributed to the reaper vs a retryable `finalizeTaskFailure` cycle.
 
 ```sql
-SELECT t.id, t.status, t.attempts,
-       l.id AS lease_id, l.created_at, l.expires_at, l.released_at
-  FROM tasks t
-  LEFT JOIN leases l ON l.task_id = t.id
- WHERE t.id = '<task-id>'
- ORDER BY l.created_at;
+SELECT id, status, attempts, max_attempts,
+       lease_token, lease_expires_at, lease_heartbeat_at,
+       failure_reason, started_at, finished_at
+  FROM tasks
+ WHERE id = '<task-id>';
 ```
 
-Expected fingerprint when the path fired:
+What you can still infer:
 
-- An older lease row with `released_at IS NOT NULL` and `expires_at < released_at` — reaper found it expired and released it.
-- A newer lease row with `released_at IS NULL` — created by `reserveOneTask` during dispatch.
-- `tasks.attempts` matches whatever was observed during the prior `running` state.
+- **`status='queued'` with `attempts=N` matching a prior observation** — the row went through some path back to `queued` without a successful claim (claim would have bumped `attempts`).
+- **`failure_reason IS NOT NULL`** — at some prior cycle the worker entered `finalizeTaskFailure`. Neither the reaper nor `reserveOneTask` clears `failure_reason`, so its presence does not prove the *most recent* cycle was a finalize-failure — only that a finalize-failure happened at some point. Cross-reference with worker logs to attribute the current cycle.
+- **`failure_reason IS NULL` and `attempts > 0`** — every prior cycle reached `running` and was reaped (the worker never entered the failure path).
 
-If the older lease's `expires_at` is in the future relative to `released_at`, the path was instead `running → pending → queued` via `finalizeTaskFailure` (retryable) followed by dispatch — which still leaves `attempts` unchanged but means the worker handler ran to a thrown error rather than the lease quietly aging out.
+If you need authoritative attribution of a specific reap-vs-finalize event, treat application logs (the reaper logs the count it reset; `recordFailure` logs the exception) as the source of truth — the row alone won't tell you.
 
 ## Related docs
 

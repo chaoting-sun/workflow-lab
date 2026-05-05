@@ -32,9 +32,9 @@ The three mechanisms cover disjoint scenarios. Removing any one of them leaves a
 
 **How it works:**
 
-- Scheduler creates a `leases` row at dispatch with `expires_at = now() + LEASE_TTL_MS`.
-- Worker runs `startHeartbeat`, which bumps `heartbeat_at` and `expires_at` every `LEASE_HEARTBEAT_MS`.
-- Reaper, running once per scheduler tick *before* dispatch, finds rows where `expires_at < now() AND released_at IS NULL`, resets the task to `pending` (or `failed` if attempts are exhausted), and releases the lease.
+- Scheduler sets `tasks.lease_token`, `lease_expires_at = now() + LEASE_TTL_MS`, and `lease_heartbeat_at = now()` at dispatch (single UPDATE inside `reserveOneTask`).
+- Worker runs `startHeartbeat`, which bumps `lease_heartbeat_at` and `lease_expires_at` every `LEASE_HEARTBEAT_MS`, gated on `lease_token = $messageToken` so a released lease is a no-op.
+- Reaper, running once per scheduler tick *before* dispatch, finds tasks where `lease_expires_at < now() AND status IN ('queued','running')`, resets the task to `pending` (or `failed` if attempts are exhausted), and clears the lease columns.
 
 **Why it lives in the DB, not in BullMQ:** the DB is the system's source of truth for what's running. BullMQ has its own death-detection (`lockDuration`), but trusting it would mean letting BullMQ decide when to re-dispatch — splitting the dispatch policy across two systems and breaking the fairness guarantees enforced by the scheduler.
 
@@ -62,7 +62,7 @@ The three mechanisms cover disjoint scenarios. Removing any one of them leaves a
 
 **How it works:** BullMQ holds a per-job lock with TTL `lockDuration`. If the worker doesn't extend the lock within that window, BullMQ assumes the worker died and re-delivers the job to another worker. This is BullMQ's own liveness check, completely independent of our DB-side reaper.
 
-**The double-delivery hazard:** if `lockDuration` is shorter than the worst-case task time, BullMQ will re-deliver a job that's still running. Our atomic-claim (`attempts=$expected AND status='queued' AND lease unreleased`) catches the duplicate and silently aborts — but it's the *last* line of defence, not the first. We want to make double-delivery impossible by construction, not just survivable.
+**The double-delivery hazard:** if `lockDuration` is shorter than the worst-case task time, BullMQ will re-deliver a job that's still running. Our atomic-claim (`attempts=$expected AND status='queued' AND lease_token=$messageToken`) catches the duplicate and silently aborts — but it's the *last* line of defence, not the first. We want to make double-delivery impossible by construction, not just survivable.
 
 **The alignment rule:**
 
@@ -78,30 +78,30 @@ The `+5000` is slack for the things that happen *after* `withTimeout` fires:
 
 Without the slack, "our timeout fires and we start cleaning up" can race "BullMQ decides we're dead and re-delivers." With it, the order is guaranteed: **our timeout always fires first, BullMQ is always the last resort.**
 
-T13 enforces this invariant at boot — `getConfig` rejects the config if the inequality is violated. The check is fail-fast on purpose; misalignment is the kind of bug you want to catch at startup, not in production at 3am.
+A boot-time cross-field check in `getConfig` enforces this invariant — startup rejects the config if the inequality is violated. The check is fail-fast on purpose; misalignment is the kind of bug you want to catch at startup, not in production at 3am.
 
 ## How they compose
 
 A timeline for a CPU task with `CPU_TIMEOUT_MS=15000`, `LEASE_TTL_MS=30000`, `LEASE_HEARTBEAT_MS=5000`, `BULLMQ_LOCK_DURATION_MS=20000`:
 
 ```
-t=0       task claimed, lease created (expires_at = t+30000)
-t=0..15s  doWork running; heartbeat bumps expires_at every 5s
+t=0       task claimed (lease_expires_at = t+30000)
+t=0..15s  doWork running; heartbeat bumps lease_expires_at every 5s
 t=15s     withTimeout rejects → recordFailure starts
-t=15.x    task → pending (or failed); lease released
-t=20s     BullMQ would consider re-delivering — but the lease is released
-          and the task is no longer 'queued'/'running', so any re-claim is
-          a silent no-op via the atomic-claim guard
+t=15.x    task → pending (or failed); lease columns cleared
+t=20s     BullMQ would consider re-delivering — but lease_token has been
+          cleared and the task is no longer 'queued'/'running', so any
+          re-claim is a silent no-op via the atomic-claim guard
 ```
 
 The same task, but the *worker process* dies at t=10s (no `withTimeout` involvement):
 
 ```
-t=0       task claimed, lease created (expires_at = t+30000)
+t=0       task claimed (lease_expires_at = t+30000)
 t=0..10s  heartbeat fires
-t=10s     process dies; heartbeat stops; expires_at frozen at t+15000
+t=10s     process dies; heartbeat stops; lease_expires_at frozen at t+15000
 t=15s     lease has expired; reaper picks it up on the next scheduler tick
-t=15.x    task → pending; lease released; re-dispatched on a future tick
+t=15.x    task → pending; lease columns cleared; re-dispatched on a future tick
 ```
 
 Each mechanism owns its scenario and stays out of the others' way.
@@ -120,4 +120,4 @@ Each mechanism owns its scenario and stays out of the others' way.
 - Reaper: `reapExpiredLeases` in `lib/scheduler.ts`, called once per `runSchedulerLoop` tick before dispatch.
 - Timeout wrapper: `withTimeout` in `lib/timeout.ts`, applied in `worker/cpu.ts`, `worker/ssh.ts`, `worker/training.ts`.
 - Failure finalize: `finalizeTaskFailure` and `recordFailure` in `lib/worker.ts`.
-- BullMQ alignment validation: `getConfig` cross-field check (T13).
+- BullMQ alignment validation: `getConfig` cross-field check.
