@@ -75,7 +75,7 @@ Tick a box only when **acceptance criteria + verification steps** for that task 
 ## Phase 4.5: Lease consolidation (ADR-0001)
 
 - [x] **T22** — Lease-into-tasks migration + helper rename (drop `leases`, add `tasks.lease_*`, rename `leaseId`→`leaseToken`, update all tests) — L
-- [ ] **T23** — Race test: `lease_token` fencing under reap-and-redispatch — S
+- [x] **T23** — Race test: `lease_token` fencing under reap-and-redispatch — S
 
 ### ✅ Checkpoint D.1 — Lease consolidation verified
 
