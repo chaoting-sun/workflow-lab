@@ -60,7 +60,7 @@ Tick a box only when **acceptance criteria + verification steps** for that task 
 ## Phase 4: Chaos & multi-user verification
 
 - [x] **T14** — Chaos knobs (`CHAOS_CPU_CRASH_RATE`, `CHAOS_SSH_TIMEOUT_RATE`, `CHAOS_SSH_MISSING_ARTIFACT_RATE`) + `pnpm worker:watch` — S
-- [ ] **T15** — Fairness panel in dashboard (per-user running counts) — S — amended by ADR-0001 (build after T22)
+- [x] **T15** — Fairness panel in dashboard (per-user running counts) — S — amended by ADR-0001 (build after T22)
 - [ ] **T16** — Run SPEC §9.2–9.6, document in `tasks/verification.md` — S
 
 ### ✅ Checkpoint D — Complete
