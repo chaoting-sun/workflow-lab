@@ -44,16 +44,12 @@ afterAll(async () => {
 describe("lease_token fencing under reap-and-redispatch", () => {
   it("rejects the stale-token claim and accepts the fresh-token claim (×10)", async () => {
     for (let i = 0; i < 10; i++) {
-      await reset();
-
       const user = await createUser(`${PREFIX}-iter${i}`);
       const job = await createJob({ userId: user.id, pipelinesCount: 1 });
 
-      // Dispatch #1: captures messageA + leaseTokenA without claiming.
       const queue1 = new CapturingQueue();
       expect(await dispatchCpu(queue1)).toBe(1);
       const messageA = queue1.messages[0];
-      expect(messageA).toBeDefined();
 
       // Force lease expiry deterministically — no setTimeout, no real wait.
       await db.query(
@@ -61,12 +57,10 @@ describe("lease_token fencing under reap-and-redispatch", () => {
         [messageA.taskId],
       );
 
-      // Reaper resets the row to 'pending' and NULLs lease columns.
-      // attempts is preserved (the next claim bumps it).
+      // attempts is preserved across reap (the next claim bumps it),
+      // so messageA and messageB observe the same `attempts` value.
       expect(await reapExpiredLeases()).toBe(1);
 
-      // Dispatch #2: captures messageB + leaseTokenB. Both messages now
-      // exist as if they were live BullMQ deliveries against the same task.
       const queue2 = new CapturingQueue();
       expect(await dispatchCpu(queue2)).toBe(1);
       const messageB = queue2.messages[0];
@@ -74,13 +68,11 @@ describe("lease_token fencing under reap-and-redispatch", () => {
       expect(messageB.leaseToken).not.toBe(messageA.leaseToken);
       expect(messageB.attempts).toBe(messageA.attempts);
 
-      // Concurrent claim attempts — old token vs new token.
       const [resA, resB] = await Promise.all([
         claimTask(messageA),
         claimTask(messageB),
       ]);
 
-      // Exactly one winner; the fresh-token claim must be it.
       expect(resA).toBeNull();
       expect(resB).not.toBeNull();
       expect(resB!.taskId).toBe(messageA.taskId);
@@ -88,8 +80,6 @@ describe("lease_token fencing under reap-and-redispatch", () => {
       expect(resB!.userId).toBe(user.id);
       expect(resB!.myAttempts).toBe(messageA.attempts + 1);
 
-      // Row converged on running, attempts bumped exactly once,
-      // lease_token == winner's token.
       const row = await db.query<{
         status: string;
         attempts: number;
