@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { db, closeDb } from "@/lib/db";
 import { ensureSchema } from "@/lib/test-helpers";
 import { POST, GET } from "@/app/api/users/route";
+import type { UserView } from "@/lib/types";
 
 const PREFIX = `t4-route-users-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 
@@ -61,5 +62,17 @@ describe("GET /api/users", () => {
     expect(body.map((u) => u.name)).toEqual(
       expect.arrayContaining([`${PREFIX}-bob`]),
     );
+  });
+
+  it("returns numeric runningCpu/runningSsh/runningTraining for each user", async () => {
+    await POST(jsonReq({ name: `${PREFIX}-eve` }));
+    const res = await GET();
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as UserView[];
+    const eve = body.find((u) => u.name === `${PREFIX}-eve`);
+    expect(eve).toBeDefined();
+    expect(eve!.runningCpu).toBe(0);
+    expect(eve!.runningSsh).toBe(0);
+    expect(eve!.runningTraining).toBe(0);
   });
 });

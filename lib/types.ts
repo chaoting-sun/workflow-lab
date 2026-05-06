@@ -3,6 +3,18 @@ export interface User {
   name: string;
 }
 
+export interface UserView extends User {
+  runningCpu: number;
+  runningSsh: number;
+  runningTraining: number;
+}
+
+export interface SlotCaps {
+  globalCpuSlots: number;
+  globalSshSlots: number;
+  globalTrainingSlots: number;
+}
+
 export type JobStatus = "pending" | "running" | "completed" | "failed";
 
 export type TaskKind = "cpu" | "ssh" | "training";

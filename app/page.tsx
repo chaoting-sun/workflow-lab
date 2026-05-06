@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import { CreateUserForm } from "./components/UserPicker";
 import { SubmitJobForm } from "./components/SubmitForm";
 import { JobList } from "./components/JobList";
+import { FairnessPanel } from "./components/FairnessPanel";
 import { apiFetch } from "@/lib/api-client";
 import type { User } from "@/lib/types";
 
@@ -60,6 +61,13 @@ export default function Page(): React.ReactElement {
           Submit job
         </h2>
         <SubmitJobForm users={users} />
+      </section>
+
+      <section className="flex flex-col gap-3 rounded border border-neutral-200 bg-white p-4">
+        <h2 className="text-sm font-semibold uppercase tracking-wide text-neutral-700">
+          Fairness
+        </h2>
+        <FairnessPanel />
       </section>
 
       <section className="flex flex-col gap-3 rounded border border-neutral-200 bg-white p-4">
