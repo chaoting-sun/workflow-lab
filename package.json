@@ -9,8 +9,11 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "worker": "tsx --env-file=.env worker/index.ts",
-    "worker:watch": "trap 'exit 0' INT TERM; until tsx --env-file=.env worker/index.ts; do echo '[worker:watch] worker exited non-zero, restarting in 1s'; sleep 1; done",
+    "scheduler": "tsx --env-file=.env scheduler/index.ts",
+    "worker:cpu": "WORKER_ROLE=cpu tsx --env-file=.env worker/index.ts",
+    "worker:io": "WORKER_ROLE=io tsx --env-file=.env worker/index.ts",
+    "worker:cpu:watch": "trap 'exit 0' INT TERM; until WORKER_ROLE=cpu tsx --env-file=.env worker/index.ts; do echo '[worker:cpu:watch] worker exited non-zero, restarting in 1s'; sleep 1; done",
+    "worker:io:watch": "trap 'exit 0' INT TERM; until WORKER_ROLE=io tsx --env-file=.env worker/index.ts; do echo '[worker:io:watch] worker exited non-zero, restarting in 1s'; sleep 1; done",
     "db:reset": "docker compose exec -T postgres psql -U workflow -d workflow_lab -f /docker-entrypoint-initdb.d/01-schema.sql"
   },
   "dependencies": {

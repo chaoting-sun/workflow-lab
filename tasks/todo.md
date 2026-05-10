@@ -61,7 +61,7 @@ Tick a box only when **acceptance criteria + verification steps** for that task 
 
 - [x] **T14** — Chaos knobs (`CHAOS_CPU_CRASH_RATE`, `CHAOS_SSH_TIMEOUT_RATE`, `CHAOS_SSH_MISSING_ARTIFACT_RATE`) + `pnpm worker:watch` — S
 - [x] **T15** — Fairness panel in dashboard (per-user running counts) — S — amended by ADR-0001 (build after T22)
-- [ ] **T16** — Run SPEC §9.2–9.6, document in `tasks/verification.md` — S
+- [x] **T16** — Run SPEC §9.2–9.6, document in `tasks/verification.md` — S
 
 ### ✅ Checkpoint D — Complete
 
@@ -79,11 +79,11 @@ Tick a box only when **acceptance criteria + verification steps** for that task 
 
 ### ✅ Checkpoint D.1 — Lease consolidation verified
 
-- [ ] T22 + T23 complete
-- [ ] All previously-passing tests green under the new schema
-- [ ] Checkpoint B happy path re-verified
-- [ ] Checkpoint C `kill -9` resilience re-verified
-- [ ] Human review before resuming T15 / T16
+- [x] T22 + T23 complete
+- [x] All previously-passing tests green under the new schema
+- [x] Checkpoint B happy path re-verified
+- [x] Checkpoint C `kill -9` resilience re-verified
+- [x] Human review before resuming T15 / T16
 
 ---
 
@@ -98,7 +98,7 @@ Tick a box only when **acceptance criteria + verification steps** for that task 
 Spec reference: SPEC §13. Motivation: once `defaultCpuWork` becomes real CPU-bound compute, a single Node process saturates one core AND blocks the lease heartbeat / BullMQ lock renewal, causing duplicate execution. Short term we keep the existing single-process `worker/index.ts`; this phase records the planned shape.
 
 - [x] **T17** — Move `defaultCpuWork` into `worker_threads` (`worker/cpu-thread.ts`); main thread keeps heartbeat + BullMQ lock renewal + `withTimeout` alive; `terminate()` the thread on timeout. Prerequisite for T18 to be useful, but valuable on its own. — M
-- [ ] **T18** — Extract `scheduler/index.ts` (advisory lock + `runSchedulerLoop` only); strip lock + scheduler loop out of `worker/index.ts`; add `WORKER_ROLE=cpu|io` switch; add `pnpm scheduler` / `pnpm worker:cpu` / `pnpm worker:io` scripts. — M
+- [x] **T18** — Extract `scheduler/index.ts` (advisory lock + `runSchedulerLoop` only); strip lock + scheduler loop out of `worker/index.ts`; add `WORKER_ROLE=cpu|io` switch; add `pnpm scheduler` / `pnpm worker:cpu` / `pnpm worker:io` scripts. — M
 - [ ] **T19** — Process supervisor (pm2 / Docker Compose / systemd template) running 1× scheduler, ~18× `worker:cpu` (`concurrency=1`), 1–2× `worker:io` (high `concurrency`). — S
 - [ ] **T20** — Re-tune `GLOBAL_CPU_SLOTS` to match deployed `worker:cpu` replicas; re-evaluate `SSH_BACKPRESSURE_THRESHOLD` against new CPU throughput. — XS
 - [ ] **T21** — Re-run SPEC §9.5 (fairness) and §9.6 (backpressure) under the multi-process layout; document results in `tasks/verification.md`. — S

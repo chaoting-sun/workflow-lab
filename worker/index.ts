@@ -1,90 +1,58 @@
-// Worker process entrypoint. Run with: pnpm worker.
-// Boots the scheduler tick loop (guarded by the Postgres advisory lock) and
-// the BullMQ Workers in a single Node process.
+// Worker process entrypoint. Run with: pnpm worker:cpu | pnpm worker:io.
+// Boots the BullMQ Workers for the kinds selected by WORKER_ROLE.
+// Scheduler tick loop + advisory lock live in `scheduler/index.ts`.
 
 import { Worker, type Job } from "bullmq";
-import { acquireSchedulerLock } from "../lib/advisory-lock";
 import { getConfig } from "../lib/config";
 import { closeDb } from "../lib/db";
-import {
-  closeQueues,
-  cpuDispatchQueue,
-  getRedisConnection,
-  sshDispatchQueue,
-  trainingDispatchQueue,
-} from "../lib/queues";
-import { runSchedulerLoop } from "../lib/scheduler";
+import { closeQueues, getRedisConnection } from "../lib/queues";
 import type { WorkerTaskMessage } from "../lib/worker";
 import { runCpuTask } from "./cpu";
+import { kindsForRole, parseWorkerRole, type TaskKind } from "./role";
 import { runSshTask } from "./ssh";
 import { runTrainingTask } from "./training";
 
-async function main(): Promise<void> {
+function buildWorker(kind: TaskKind): Worker<WorkerTaskMessage> {
   const cfg = getConfig();
-
-  const lock = await acquireSchedulerLock();
-  if (!lock) {
-    console.error(
-      "scheduler advisory lock not acquired — another instance is running. Exiting.",
-    );
-    process.exit(1);
+  let handler: (msg: WorkerTaskMessage) => Promise<void>;
+  let concurrency: number;
+  switch (kind) {
+    case "cpu":
+      handler = runCpuTask;
+      concurrency = cfg.CPU_WORKER_CONCURRENCY;
+      break;
+    case "ssh":
+      handler = runSshTask;
+      concurrency = cfg.SSH_WORKER_CONCURRENCY;
+      break;
+    case "training":
+      handler = runTrainingTask;
+      concurrency = cfg.TRAINING_WORKER_CONCURRENCY;
+      break;
   }
-  console.log("scheduler lock acquired");
-
-  const cpuWorker = new Worker<WorkerTaskMessage>(
-    "cpu",
+  const worker = new Worker<WorkerTaskMessage>(
+    kind,
     async (job: Job<WorkerTaskMessage>) => {
-      await runCpuTask(job.data);
+      await handler(job.data);
     },
     {
       connection: getRedisConnection(),
       lockDuration: cfg.BULLMQ_LOCK_DURATION_MS,
-      concurrency: cfg.CPU_WORKER_CONCURRENCY,
+      concurrency,
     },
   );
-  cpuWorker.on("failed", (job, err) => {
-    console.error(`cpu job ${job?.id} failed:`, err);
+  worker.on("failed", (job, err) => {
+    console.error(`${kind} job ${job?.id} failed:`, err);
   });
+  return worker;
+}
 
-  const sshWorker = new Worker<WorkerTaskMessage>(
-    "ssh",
-    async (job: Job<WorkerTaskMessage>) => {
-      await runSshTask(job.data);
-    },
-    {
-      connection: getRedisConnection(),
-      lockDuration: cfg.BULLMQ_LOCK_DURATION_MS,
-      concurrency: cfg.SSH_WORKER_CONCURRENCY,
-    },
-  );
-  sshWorker.on("failed", (job, err) => {
-    console.error(`ssh job ${job?.id} failed:`, err);
-  });
+async function main(): Promise<void> {
+  const role = parseWorkerRole(process.env.WORKER_ROLE);
+  const kinds = kindsForRole(role);
+  console.log(`worker role=${role} kinds=${kinds.join(",")}`);
 
-  const trainingWorker = new Worker<WorkerTaskMessage>(
-    "training",
-    async (job: Job<WorkerTaskMessage>) => {
-      await runTrainingTask(job.data);
-    },
-    {
-      connection: getRedisConnection(),
-      lockDuration: cfg.BULLMQ_LOCK_DURATION_MS,
-      concurrency: cfg.TRAINING_WORKER_CONCURRENCY,
-    },
-  );
-  trainingWorker.on("failed", (job, err) => {
-    console.error(`training job ${job?.id} failed:`, err);
-  });
-
-  const loop = runSchedulerLoop({
-    queues: {
-      cpu: cpuDispatchQueue,
-      ssh: sshDispatchQueue,
-      training: trainingDispatchQueue,
-    },
-    intervalMs: cfg.SCHEDULER_TICK_MS,
-  });
-  console.log(`scheduler tick loop started (interval=${cfg.SCHEDULER_TICK_MS}ms)`);
+  const workers = kinds.map(buildWorker);
 
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {
@@ -92,12 +60,8 @@ async function main(): Promise<void> {
     shuttingDown = true;
     console.log(`received ${signal}, shutting down`);
     try {
-      await loop.stop();
-      await cpuWorker.close();
-      await sshWorker.close();
-      await trainingWorker.close();
+      for (const w of workers) await w.close();
       await closeQueues();
-      await lock.release();
       await closeDb();
     } catch (err) {
       console.error("error during shutdown:", err);

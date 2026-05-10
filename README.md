@@ -53,21 +53,32 @@ This runs `psql` **inside the Postgres container**, against the schema file alre
 
 > The script hardcodes `-U workflow -d workflow_lab` to match `POSTGRES_USER` / `POSTGRES_DB` in `docker-compose.yml`. If you change those, update `db:reset` in `package.json` too.
 
-## 4. Run the app and the worker
+## 4. Run the app, scheduler, and workers
 
-You need **two processes** running in parallel:
+The scheduler tick and the BullMQ workers run as **separate processes** so CPU
+workers can scale independently from the lighter IO workers (see SPEC §13).
+You need four terminals for local development:
 
 ```bash
 # Terminal 1 — Next.js dev server (API routes + dashboard UI)
 pnpm dev
 
-# Terminal 2 — scheduler + BullMQ workers (CPU / SSH / training queues)
-pnpm worker
+# Terminal 2 — scheduler tick (single instance, holds the advisory lock)
+pnpm scheduler
+
+# Terminal 3 — CPU worker (handles the cpu BullMQ queue)
+pnpm worker:cpu
+
+# Terminal 4 — IO worker (handles ssh + training BullMQ queues)
+pnpm worker:io
 ```
 
 Then open <http://localhost:3000> to use the dashboard and submit a job.
 
-The worker process owns the scheduler tick and all three BullMQ workers; without it, jobs will be created in Postgres but no tasks will ever execute.
+For chaos scenarios that crash the CPU worker (`CHAOS_CPU_CRASH_RATE>0`),
+use `pnpm worker:cpu:watch` instead — it auto-restarts on `process.exit(1)`.
+Without the scheduler running, jobs will be created in Postgres but no tasks
+will ever be dispatched.
 
 ## Other commands
 
