@@ -11,14 +11,17 @@ import {
 } from "../lib/worker";
 import { runCpuWork } from "./cpu-thread";
 
-export type CpuWorkFn = (taskId: string) => Promise<string>;
+export type CpuWorkFn = (taskId: string, signal?: AbortSignal) => Promise<string>;
 
 export interface RunCpuOptions {
   // Override CPU_TIMEOUT_MS for tests; production uses config.
   timeoutMs?: number;
 }
 
-export async function defaultCpuWork(taskId: string): Promise<string> {
+export async function defaultCpuWork(
+  taskId: string,
+  _signal?: AbortSignal,
+): Promise<string> {
   return runCpuWork(taskId);
 }
 
@@ -42,14 +45,23 @@ export async function runCpuTask(
 
   const timeoutMs = opts.timeoutMs ?? getConfig().CPU_TIMEOUT_MS;
   const heartbeat = startHeartbeat(msg.taskId, msg.leaseToken);
+  // The AbortController lets defaultCpuWork tear down its worker_thread when
+  // withTimeout fires (or anything else throws). Aborting in `finally` makes
+  // success, timeout, and StaleAttemptError paths all converge on the same
+  // cleanup.
+  const ac = new AbortController();
   try {
-    const artifactPath = await withTimeout(doWork(claimed.taskId), timeoutMs);
+    const artifactPath = await withTimeout(
+      doWork(claimed.taskId, ac.signal),
+      timeoutMs,
+    );
     await access(artifactPath);
     await finalizeCpuSuccess(claimed, artifactPath);
   } catch (err) {
     if (err instanceof StaleAttemptError) return;
     await recordFailure(claimed, err);
   } finally {
+    ac.abort();
     heartbeat.stop();
   }
 }

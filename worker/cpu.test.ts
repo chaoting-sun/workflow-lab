@@ -223,6 +223,30 @@ describe("runCpuTask", () => {
     expect(job.rows[0].status).toBe("failed");
   });
 
+  it("aborts the AbortSignal it passes to doWork when the timeout fires (so the worker_thread can be terminated)", async () => {
+    const u = await createUser(`${PREFIX}-abort-on-timeout`);
+    const fx = await makeQueuedCpuTaskWithLease(u.id);
+
+    let captured: AbortSignal | undefined;
+    const slowWork = (_taskId: string, signal?: AbortSignal): Promise<string> => {
+      captured = signal;
+      // Resolve only when the signal aborts so runCpuTask doesn't hang
+      // forever; the timeout/abort wiring is what we're testing.
+      return new Promise((_, reject) => {
+        signal?.addEventListener(
+          "abort",
+          () => reject(new Error("aborted by test")),
+          { once: true },
+        );
+      });
+    };
+
+    await runCpuTask(msg(fx), slowWork, { timeoutMs: 30 });
+
+    expect(captured).toBeDefined();
+    expect(captured?.aborted).toBe(true);
+  });
+
   it("a duplicate delivery of the same message is a no-op the second time", async () => {
     const u = await createUser(`${PREFIX}-dup`);
     const fx = await makeQueuedCpuTaskWithLease(u.id);
