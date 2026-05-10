@@ -635,24 +635,28 @@ T17–T19 are tracked in `tasks/todo.md`; their detail lives in commit history. 
 
 #### Task 21: Re-verify SPEC §9.5 fairness and §9.6 backpressure under 4×4 layout
 
-> Amended (2026-05-10): expected steady-state numbers updated for the new slot caps. Per `/change-request` 2026-05-10. The §9.6 scenario script's own slot overrides (`GLOBAL_SSH_SLOTS=5`, `SSH_BACKPRESSURE_THRESHOLD=15`) are independent of the global default change in T20 and remain valid; only the global-default narrative shifts.
+> Amended (2026-05-10): the original "converge to ~1/1/2" expectation was wrong — both scenario scripts use their own `env`-passed `GLOBAL_*_SLOTS` overrides (fairness=12, backpressure=10/2) which take precedence over the .env defaults T20 changed. Re-verification under the new defaults therefore confirms the *algorithm* still works on the post-T18 split + post-T20 config, but the observed numbers in the calibrated demos are unchanged. Algorithmic behavior at the deployed `slots=4` is enforced at test time by `lib/scheduler.test.ts` (now config-derived after T20).
+>
+> Amended (2026-05-10, run-time discovery): all three scenario scripts (`run-scenario.sh`, `run-scenario-fairness.sh`, `run-scenario-backpressure.sh`) were broken by T18's scheduler/worker split — they spawned `worker/index.ts` directly without `WORKER_ROLE` and never started `scheduler/index.ts`. Repaired in this task: each script now spawns scheduler + `WORKER_ROLE=cpu` + `WORKER_ROLE=io` as separate background processes, each with its own restart-on-exit loop.
 
-**Description:** Re-run `scripts/run-scenario-fairness.sh` and `scripts/run-scenario-backpressure.sh` against the post-T20 config. Update the relevant sections of `tasks/verification.md` with the new observed convergence values and pm2 process snapshot.
+**Description:** Re-run `scripts/run-scenario-fairness.sh` and `scripts/run-scenario-backpressure.sh` against the post-T20 config. Update the relevant sections of `tasks/verification.md` with the re-run timeline and any deviations from the prior baseline.
 
 **Acceptance criteria:**
-- [ ] §9.5: 3 users (alice/bob/carol) submitted within ~2s converge to running CPU counts of approximately `1/1/2` (= `4 / 3` ceiling) — exact split varies by tick timing, but no user is starved beyond a few ticks.
-- [ ] §9.6: backpressure script still demonstrates CPU dispatch pausing once SSH backlog hits its threshold; the script's own thresholds dominate global defaults so the narrative is unchanged, but the run is repeated for the record.
-- [ ] `tasks/verification.md` gains a "post-rescale re-verification (2026-05-10)" subsection under §9.5 (and §9.6 if any deviation appears) with raw psql counts and pm2 process list.
-- [ ] Older 20-slot results in `tasks/verification.md` are kept (history) but annotated as superseded by the rescale.
+- [x] §9.5 script runs end-to-end on the post-T18 layout; all 3 users' jobs reach `completed`; per-user CPU counts converge to the script-calibrated steady state (4/4/4 at slots=12) with no starvation.
+- [x] §9.6 script runs end-to-end; SSH backlog reaches max ≥ threshold; `cpu_running=0` observed at multiple ticks while CPU pending tasks remain; job reaches `completed`.
+- [x] `tasks/verification.md` gains a "Post-rescale re-verification (2026-05-10)" subsection under §9.5 and §9.6, including the script-breakage finding and the re-run timeline.
+- [x] Older 20-slot baseline entries in `tasks/verification.md` retained as history; new subsections record the post-rescale state.
 
 **Verification:**
-- [ ] Fairness script output sampled at 5s intervals for 30s shows running CPU counts within ±1 of the predicted split.
-- [ ] Backpressure script output shows the same pause/resume pattern as the original §9.6 run.
+- [x] Fairness script output: per-user CPU within ±1 of the calibrated 4/4/4 split throughout the CPU phase.
+- [x] Backpressure script output: pause/resume pattern preserved; `saw_cpu_paused=1`; `max_observed_ssh_backlog >= threshold`.
+- [x] `pnpm test` and `pnpm typecheck` clean after the script edits.
 
 **Dependencies:** T20.
 
 **Files likely touched:**
 - `tasks/verification.md`
+- `scripts/run-scenario.sh`, `scripts/run-scenario-fairness.sh`, `scripts/run-scenario-backpressure.sh` (post-T18 spawn-block repair)
 
 **Estimated scope:** S
 

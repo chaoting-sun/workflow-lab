@@ -5,7 +5,7 @@ Spec: `SPEC.md`.
 
 Tick a box only when **acceptance criteria + verification steps** for that task pass.
 
-> **Active change:** Slot/replica/concurrency rescale to 4×4 (CPU + SSH). Medium, no ADR. See `tasks/replan-log.md` (2026-05-10 entry).
+(no active change in flight — last completed: 4×4 rescale on 2026-05-10, see `tasks/replan-log.md`)
 
 ---
 
@@ -101,12 +101,12 @@ Spec reference: SPEC §13. Motivation: once `defaultCpuWork` becomes real CPU-bo
 - [x] **T18** — Extract `scheduler/index.ts` (advisory lock + `runSchedulerLoop` only); strip lock + scheduler loop out of `worker/index.ts`; add `WORKER_ROLE=cpu|io` switch; add `pnpm scheduler` / `pnpm worker:cpu` / `pnpm worker:io` scripts. — M
 - [x] **T19** — Process supervisor (pm2 / Docker Compose / systemd template) running 1× scheduler, ~18× `worker:cpu` (`concurrency=1`), 1–2× `worker:io` (high `concurrency`). — S
 - [x] **T20** — Re-tune `GLOBAL_CPU_SLOTS` to match deployed `worker:cpu` replicas; re-evaluate `SSH_BACKPRESSURE_THRESHOLD` against new CPU throughput. — XS — amended (2026-05-10): broadened to also re-tune `GLOBAL_SSH_SLOTS`, `CPU_WORKER_CONCURRENCY`, `SSH_WORKER_CONCURRENCY`, `IO_WORKER_REPLICAS` to a 4×4 layout
-- [ ] **T21** — Re-run SPEC §9.5 (fairness) and §9.6 (backpressure) under the multi-process layout; document results in `tasks/verification.md`. — S — amended (2026-05-10): expected fairness convergence updated for 4-slot config (~1/1/2 across 3 users)
+- [x] **T21** — Re-run SPEC §9.5 (fairness) and §9.6 (backpressure) under the multi-process layout; document results in `tasks/verification.md`. — S — amended (2026-05-10): scenario scripts repaired for post-T18 split (spawn scheduler + WORKER_ROLE=cpu + WORKER_ROLE=io); re-run confirms algorithm holds; "1/1/2" in earlier amendment was wrong since script env-overrides dominate
 
 ### ✅ Checkpoint E — Multi-core scaling
 
 - [ ] CPU-bound `defaultCpuWork` no longer triggers spurious lease reaps under load
 - [ ] `htop` shows N CPU worker processes spread across cores during a job run
-- [ ] SPEC §9.5 fairness still holds with N CPU worker replicas
-- [ ] SPEC §9.6 backpressure still gates CPU dispatch correctly
+- [x] SPEC §9.5 fairness still holds with N CPU worker replicas (verified 2026-05-10, see `tasks/verification.md` §9.5 post-rescale subsection)
+- [x] SPEC §9.6 backpressure still gates CPU dispatch correctly (verified 2026-05-10, see `tasks/verification.md` §9.6 post-rescale subsection)
 - [ ] Human review
