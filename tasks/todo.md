@@ -99,7 +99,7 @@ Spec reference: SPEC §13. Motivation: once `defaultCpuWork` becomes real CPU-bo
 
 - [x] **T17** — Move `defaultCpuWork` into `worker_threads` (`worker/cpu-thread.ts`); main thread keeps heartbeat + BullMQ lock renewal + `withTimeout` alive; `terminate()` the thread on timeout. Prerequisite for T18 to be useful, but valuable on its own. — M
 - [x] **T18** — Extract `scheduler/index.ts` (advisory lock + `runSchedulerLoop` only); strip lock + scheduler loop out of `worker/index.ts`; add `WORKER_ROLE=cpu|io` switch; add `pnpm scheduler` / `pnpm worker:cpu` / `pnpm worker:io` scripts. — M
-- [ ] **T19** — Process supervisor (pm2 / Docker Compose / systemd template) running 1× scheduler, ~18× `worker:cpu` (`concurrency=1`), 1–2× `worker:io` (high `concurrency`). — S
+- [x] **T19** — Process supervisor (pm2 / Docker Compose / systemd template) running 1× scheduler, ~18× `worker:cpu` (`concurrency=1`), 1–2× `worker:io` (high `concurrency`). — S
 - [ ] **T20** — Re-tune `GLOBAL_CPU_SLOTS` to match deployed `worker:cpu` replicas; re-evaluate `SSH_BACKPRESSURE_THRESHOLD` against new CPU throughput. — XS
 - [ ] **T21** — Re-run SPEC §9.5 (fairness) and §9.6 (backpressure) under the multi-process layout; document results in `tasks/verification.md`. — S
 
