@@ -598,6 +598,66 @@ Goal: collapse the independent `leases` table into ownership columns on `tasks` 
 
 ---
 
+### Phase 5: Multi-process / multi-core scaling
+
+T17–T19 are tracked in `tasks/todo.md`; their detail lives in commit history. Only the open tasks (T20, T21) carry full bodies here.
+
+#### Task 20: Slot / replica / concurrency re-tune to 4×4
+
+> Amended (2026-05-10): original todo line scoped only `GLOBAL_CPU_SLOTS` and `SSH_BACKPRESSURE_THRESHOLD`. Broadened to also cover `GLOBAL_SSH_SLOTS`, `CPU_WORKER_CONCURRENCY`, `SSH_WORKER_CONCURRENCY`, and `IO_WORKER_REPLICAS`, per `/change-request` 2026-05-10 (路 A — keep SSH inside `worker:io`, scale via replicas; no SPEC §13.2 change). Reason: align scheduler dispatch caps with deployed process counts so "1 process saturates 1 slot" holds for both CPU and SSH layers without splitting SSH into its own role.
+
+**Description:** Re-tune the runtime knobs so CPU and SSH each have 4 scheduler slots backed by 4 host processes. CPU side leans on the existing `ecosystem.config.cjs` rule that `cpuReplicas = GLOBAL_CPU_SLOTS` (default fallback 18); changing `.env` cascades to pm2 automatically. SSH side stays inside `worker:io`: bump `IO_WORKER_REPLICAS=4` and drop `SSH_WORKER_CONCURRENCY` to 1 so 4 io processes × 1 in-process SSH = 4 SSH slots. `SSH_BACKPRESSURE_THRESHOLD` scales with `2 × GLOBAL_SSH_SLOTS` per SPEC §3.8 default. No code changes — config + env only.
+
+**Acceptance criteria:**
+- [ ] `.env` and `.env.example`: `GLOBAL_CPU_SLOTS=4`, `GLOBAL_SSH_SLOTS=4`, `CPU_WORKER_CONCURRENCY=4`, `SSH_WORKER_CONCURRENCY=1`, `SSH_BACKPRESSURE_THRESHOLD=8`. `GLOBAL_TRAINING_SLOTS` and `TRAINING_WORKER_CONCURRENCY` unchanged.
+- [ ] No edits to `lib/config.ts` schema, `lib/scheduler.ts`, `lib/worker.ts`, or any worker handler — these are env-driven.
+- [ ] `ecosystem.config.cjs` unchanged for CPU (auto-tracks `GLOBAL_CPU_SLOTS`); add or expose `IO_WORKER_REPLICAS` so the io role boots 4 replicas.
+- [ ] Boot under pm2: `pm2 list` shows exactly 4× `worker:cpu` and 4× `worker:io` (plus 1× scheduler).
+- [ ] The pre-existing invariant `*_TIMEOUT_MS + 5000 ≤ BULLMQ_LOCK_DURATION_MS` still holds (no change here).
+- [ ] Avoid the `GLOBAL_*_SLOTS > *_WORKER_CONCURRENCY` trap recorded in `tasks/verification.md` §9.1 (lines 52–65): with the new values both sides are equal (CPU 4=4) or `SLOTS > CONCURRENCY × replicas` does not occur (SSH 4 = 4 × 1).
+
+**Verification:**
+- [ ] `pnpm typecheck` clean.
+- [ ] `psql` query during a small job (`PIPELINES_PER_JOB=20`): `select count(*) from tasks where kind='cpu' and lease_token is not null and lease_expires_at > now()` ≤ 4 at every sample.
+- [ ] Same query for `kind='ssh'` ≤ 4 at every sample.
+- [ ] `pm2 logs scheduler` shows backpressure firing at SSH backlog ≥ 8 (formerly 80).
+- [ ] Re-run §9.1 happy path with `PIPELINES_PER_JOB=20` (smaller than 200 because 4 CPU slots make 200 pipelines slow): job ends in `completed`, 0 `lease_expired` failures.
+
+**Dependencies:** T19 (process supervisor template).
+
+**Files likely touched:**
+- `.env`, `.env.example`
+- `ecosystem.config.cjs` (only if `IO_WORKER_REPLICAS` is not yet exposed; see file before edit)
+
+**Estimated scope:** XS
+
+---
+
+#### Task 21: Re-verify SPEC §9.5 fairness and §9.6 backpressure under 4×4 layout
+
+> Amended (2026-05-10): expected steady-state numbers updated for the new slot caps. Per `/change-request` 2026-05-10. The §9.6 scenario script's own slot overrides (`GLOBAL_SSH_SLOTS=5`, `SSH_BACKPRESSURE_THRESHOLD=15`) are independent of the global default change in T20 and remain valid; only the global-default narrative shifts.
+
+**Description:** Re-run `scripts/run-scenario-fairness.sh` and `scripts/run-scenario-backpressure.sh` against the post-T20 config. Update the relevant sections of `tasks/verification.md` with the new observed convergence values and pm2 process snapshot.
+
+**Acceptance criteria:**
+- [ ] §9.5: 3 users (alice/bob/carol) submitted within ~2s converge to running CPU counts of approximately `1/1/2` (= `4 / 3` ceiling) — exact split varies by tick timing, but no user is starved beyond a few ticks.
+- [ ] §9.6: backpressure script still demonstrates CPU dispatch pausing once SSH backlog hits its threshold; the script's own thresholds dominate global defaults so the narrative is unchanged, but the run is repeated for the record.
+- [ ] `tasks/verification.md` gains a "post-rescale re-verification (2026-05-10)" subsection under §9.5 (and §9.6 if any deviation appears) with raw psql counts and pm2 process list.
+- [ ] Older 20-slot results in `tasks/verification.md` are kept (history) but annotated as superseded by the rescale.
+
+**Verification:**
+- [ ] Fairness script output sampled at 5s intervals for 30s shows running CPU counts within ±1 of the predicted split.
+- [ ] Backpressure script output shows the same pause/resume pattern as the original §9.6 run.
+
+**Dependencies:** T20.
+
+**Files likely touched:**
+- `tasks/verification.md`
+
+**Estimated scope:** S
+
+---
+
 ## Risks and Mitigations
 
 | Risk | Impact | Mitigation |

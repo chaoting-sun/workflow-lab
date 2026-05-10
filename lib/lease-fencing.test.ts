@@ -44,6 +44,10 @@ afterAll(async () => {
 describe("lease_token fencing under reap-and-redispatch", () => {
   it("rejects the stale-token claim and accepts the fresh-token claim (×10)", async () => {
     for (let i = 0; i < 10; i++) {
+      // Reset between iterations: the lingering running-tasks from prior
+      // iterations would otherwise consume the global CPU slot pool and
+      // make dispatchCpu return 0 once the pool is small (GLOBAL_CPU_SLOTS=4).
+      await reset();
       const user = await createUser(`${PREFIX}-iter${i}`);
       const job = await createJob({ userId: user.id, pipelinesCount: 1 });
 

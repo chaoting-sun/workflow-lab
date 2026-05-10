@@ -65,11 +65,12 @@ describe("dispatchCpu", () => {
   });
 
   it("dispatches at most (GLOBAL_CPU_SLOTS - used) tasks per call", async () => {
-    // GLOBAL_CPU_SLOTS=20 (.env.example). Pre-fill 18 active leases under one
-    // user so only 2 free slots remain. Then submit a job with 5 pending
-    // tasks under a different user — we expect exactly 2 to be dispatched.
+    // Pre-fill (GLOBAL_CPU_SLOTS - 2) active leases under one user so exactly
+    // 2 free slots remain. Then submit a job with 5 pending tasks under a
+    // different user — we expect exactly 2 to be dispatched.
+    const slots = getConfig().GLOBAL_CPU_SLOTS;
     const filler = await createUser(`${PREFIX}-filler`);
-    await fillActiveCpuLeases(filler.id, 18);
+    await fillActiveCpuLeases(filler.id, slots - 2);
 
     const u = await createUser(`${PREFIX}-u`);
     await createJob({ userId: u.id, pipelinesCount: 5 });
@@ -89,8 +90,9 @@ describe("dispatchCpu", () => {
   });
 
   it("dispatches nothing when there are no free slots", async () => {
+    const slots = getConfig().GLOBAL_CPU_SLOTS;
     const filler = await createUser(`${PREFIX}-filler`);
-    await fillActiveCpuLeases(filler.id, 20);
+    await fillActiveCpuLeases(filler.id, slots);
 
     const u = await createUser(`${PREFIX}-u`);
     await createJob({ userId: u.id, pipelinesCount: 5 });
@@ -179,15 +181,16 @@ describe("dispatchCpu", () => {
   });
 
   it("interleaves dispatch between two jobs of the same user (per-job fairness)", async () => {
-    // Single user submits jobs A then B, each with 3 pending CPU tasks. Without
-    // per-job fairness, j.created_at would drain A entirely before touching B.
+    // Single user submits jobs A then B. Without per-job fairness, j.created_at
+    // would drain A entirely before touching B. Use 2 tasks per job so the
+    // interleaved [A,B,A,B] pattern fits in any GLOBAL_CPU_SLOTS >= 4.
     const u = await createUser(`${PREFIX}-multi-job`);
-    const a = await createJob({ userId: u.id, pipelinesCount: 3 });
-    const b = await createJob({ userId: u.id, pipelinesCount: 3 });
+    const a = await createJob({ userId: u.id, pipelinesCount: 2 });
+    const b = await createJob({ userId: u.id, pipelinesCount: 2 });
 
     const queue = new FakeQueue();
     const n = await dispatchCpu(queue);
-    expect(n).toBe(6);
+    expect(n).toBe(4);
 
     const order: string[] = [];
     for (const m of queue.messages) {
@@ -197,7 +200,7 @@ describe("dispatchCpu", () => {
       );
       order.push(rows[0].job_id === a.jobId ? "A" : "B");
     }
-    expect(order).toEqual(["A", "B", "A", "B", "A", "B"]);
+    expect(order).toEqual(["A", "B", "A", "B"]);
   });
 
   it("preserves lease + queued status if queue.add throws (reaper recovers later)", async () => {
