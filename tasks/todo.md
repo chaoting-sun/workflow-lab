@@ -138,14 +138,14 @@ Audit performed 2026-05-11. Source files without a `.test.ts` sibling and missin
 
 ### Frontend (untested entirely)
 
-- [ ] **T34** — Decide and document frontend component-test posture. `app/components/*` and `app/page.tsx` have zero coverage and no testing library is installed. Either add `@testing-library/react` + vitest jsdom and start with `SubmitForm`/`JobList`, or explicitly defer and rely on E2E. Record decision. — XS
+- [x] **T34** — Decide and document frontend component-test posture. `app/components/*` and `app/page.tsx` have zero coverage and no testing library is installed. Either add `@testing-library/react` + vitest jsdom and start with `SubmitForm`/`JobList`, or explicitly defer and rely on E2E. Record decision. — XS — decision: defer (option b), see `docs/adr/0003-frontend-test-posture.md`; re-open triggers documented there
 
 ### ✅ Checkpoint F — Test coverage
 
 - [ ] All untested `lib/` source files have a sibling `.test.ts` (or an explicit deferral note)
 - [ ] At least one integration test exercises the real BullMQ wire
 - [ ] E2E posture decided and either implemented or explicitly deferred with rationale
-- [ ] Frontend test posture decided and either implemented or explicitly deferred with rationale
+- [x] Frontend test posture decided and either implemented or explicitly deferred with rationale — ADR-0003 (deferred)
 - [ ] `pnpm test` green
 - [ ] `pnpm typecheck` green
 - [ ] Human review
