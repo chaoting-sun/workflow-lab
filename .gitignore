@@ -21,3 +21,4 @@ next-env.d.ts
 tsconfig.tsbuildinfo
 
 */learn/
+.claude/

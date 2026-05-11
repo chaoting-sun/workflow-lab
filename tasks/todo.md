@@ -110,3 +110,42 @@ Spec reference: SPEC §13. Motivation: once `defaultCpuWork` becomes real CPU-bo
 - [x] SPEC §9.5 fairness still holds with N CPU worker replicas (verified 2026-05-10, see `tasks/verification.md` §9.5 post-rescale subsection)
 - [x] SPEC §9.6 backpressure still gates CPU dispatch correctly (verified 2026-05-10, see `tasks/verification.md` §9.6 post-rescale subsection)
 - [x] Human review
+
+---
+
+## Phase 6: Test coverage uplift (planned)
+
+Audit performed 2026-05-11. Source files without a `.test.ts` sibling and missing test layers identified below. Vitest is the only test runner installed; no Playwright/Cypress/component-testing library. `tests/api/*` are route-level integration tests against a real DB; `lib/lease-fencing.test.ts` is the only cross-module integration test, and it uses an in-memory `CapturingQueue` (no real BullMQ wire).
+
+### Unit-layer gaps
+
+- [x] **T24** — `lib/api-errors.test.ts`: cover every error-class → HTTP-status mapping, including the catch-all branch. Pure, no DB. — XS
+- [x] **T25** — `lib/queues.test.ts`: assert BullMQ queue names, prefixes, and connection options match `lib/config.ts`. Guard against silent drift when config keys change. — S
+- [x] **T26** — `lib/artifacts.test.ts`: filesystem write/read round-trip in a tmp dir; assert path conventions match what the SSH worker writes. — XS
+- [x] **T27** — Audit `tests/api/jobs/[id]/route.test.ts` for coverage of cancel/DELETE and not-found paths; fill any gaps. Route is GET-only (no DELETE exists); added tests for progress accuracy under succeeded/failed task states and for job-status field after transition. — XS
+- [x] **T28** — Entry-point test for `worker/index.ts`: `WORKER_ROLE=cpu|io` selects the right loop, SIGTERM exits cleanly with code 0 (so `worker:*:watch` does not restart on intended shutdown). — S
+- [x] **T29** — Entry-point test for `scheduler/index.ts`: advisory-lock acquisition gates `runSchedulerLoop`; second instance backs off. Happy-path SIGTERM test runtime-skips when an external supervisor already holds the lock (e.g. pm2). — S
+
+### Integration-layer gaps
+
+- [ ] **T30** — Real-Redis dispatch pipeline test: enqueue via `scheduler.dispatchCpu` against a real BullMQ instance (test Redis db index), drain via `worker.claimTask`, assert lease acquisition + task completion. Highest-value missing test; the in-memory queue in `lease-fencing.test.ts` does not prove the wire works. — M
+- [ ] **T31** — Chaos injection end-to-end: with `CHAOS_CPU_CRASH_RATE`/`CHAOS_SSH_TIMEOUT_RATE`/`CHAOS_SSH_MISSING_ARTIFACT_RATE` > 0, assert the corresponding failure modes surface in `jobs` rows (not just that the unit-level chaos helpers fire). — S
+
+### E2E gaps (none today)
+
+- [ ] **T32** — Decide and document E2E posture in an ADR. Options: (a) lightweight HTTP E2E via `supertest` + a spawned worker/scheduler; (b) browser E2E via Playwright; (c) keep `scripts/run-scenario-*.sh` and add assertions (parse `/api/jobs` JSON, exit non-zero on mismatch). — XS
+- [ ] **T33** — Implement one happy-path E2E per the T32 decision: submit job → observe completion via the chosen surface. — M (size depends on T32)
+
+### Frontend (untested entirely)
+
+- [ ] **T34** — Decide and document frontend component-test posture. `app/components/*` and `app/page.tsx` have zero coverage and no testing library is installed. Either add `@testing-library/react` + vitest jsdom and start with `SubmitForm`/`JobList`, or explicitly defer and rely on E2E. Record decision. — XS
+
+### ✅ Checkpoint F — Test coverage
+
+- [ ] All untested `lib/` source files have a sibling `.test.ts` (or an explicit deferral note)
+- [ ] At least one integration test exercises the real BullMQ wire
+- [ ] E2E posture decided and either implemented or explicitly deferred with rationale
+- [ ] Frontend test posture decided and either implemented or explicitly deferred with rationale
+- [ ] `pnpm test` green
+- [ ] `pnpm typecheck` green
+- [ ] Human review

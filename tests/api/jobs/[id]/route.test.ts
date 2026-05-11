@@ -63,4 +63,58 @@ describe("GET /api/jobs/:id", () => {
     const res = await GET(new Request("http://test/api/jobs/bogus"), ctx("bogus"));
     expect(res.status).toBe(400);
   });
+
+  it("reflects succeeded and failed cpu task counts in the progress buckets", async () => {
+    // Set up a second job we can mutate without disturbing the happy-path test.
+    // Only cpu tasks exist at creation time — ssh/training rows are inserted
+    // later by the worker pipeline, so we can only exercise cpu progress here.
+    const job = await createJob({ userId, pipelinesCount: 3 });
+    await db.query(
+      `UPDATE tasks SET status='succeeded'
+         WHERE id IN (SELECT id FROM tasks WHERE job_id=$1 AND kind='cpu' LIMIT 2)`,
+      [job.jobId],
+    );
+    await db.query(
+      `UPDATE tasks SET status='failed'
+         WHERE id IN (
+           SELECT id FROM tasks WHERE job_id=$1 AND kind='cpu' AND status='pending' LIMIT 1
+         )`,
+      [job.jobId],
+    );
+
+    const res = await GET(
+      new Request(`http://test/api/jobs/${job.jobId}`),
+      ctx(job.jobId),
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      progress: {
+        cpu: { done: number; total: number; failed: number };
+        ssh: { done: number; total: number; failed: number };
+        training: { done: number; total: number; failed: number };
+      };
+    };
+    expect(body.progress.cpu).toEqual({ done: 2, total: 3, failed: 1 });
+    // ssh / training totals are derived from pipelinesCount, not actual row
+    // counts, so they remain at their initial shape even with no rows present.
+    expect(body.progress.ssh).toEqual({ done: 0, total: 3, failed: 0 });
+    expect(body.progress.training).toEqual({ done: 0, total: 1, failed: 0 });
+  });
+
+  it("surfaces the job status field when the job has been transitioned", async () => {
+    const job = await createJob({ userId, pipelinesCount: 2 });
+    await db.query(
+      `UPDATE jobs SET status='failed', completed_at=now() WHERE id=$1`,
+      [job.jobId],
+    );
+
+    const res = await GET(
+      new Request(`http://test/api/jobs/${job.jobId}`),
+      ctx(job.jobId),
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { status: string; completedAt: string | null };
+    expect(body.status).toBe("failed");
+    expect(body.completedAt).not.toBeNull();
+  });
 });
