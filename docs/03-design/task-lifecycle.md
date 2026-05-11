@@ -2,6 +2,23 @@
 
 This doc captures how `tasks.status` transitions are produced, which writers touch `attempts`, and what graceful shutdown actually does. It exists because a `running → queued` transition with **no change to `attempts`** looks impossible at first reading — there is no direct writer for it. The transition is real, and is always the composition of two separate writes.
 
+## States at a glance
+
+```mermaid
+stateDiagram-v2
+    [*] --> pending: insert
+    pending --> queued: reserveOneTask
+    queued --> running: claimTask (attempts +1)
+    running --> succeeded: finalize success
+    running --> pending: retryable failure
+    running --> pending: reaper (lease expired)
+    running --> failed: terminal failure (attempts exhausted)
+    succeeded --> [*]
+    failed --> [*]
+```
+
+`running → queued` is **not** drawn — it has no direct writer. It only appears as the two-step composition `running → pending → queued` (reap, then dispatch). See [the "running → queued" puzzle](#the-running--queued-puzzle) below.
+
 ## Status transitions and their writers
 
 | From → To           | Writer                                          | Touches `attempts`? |
