@@ -142,10 +142,10 @@ Audit performed 2026-05-11. Source files without a `.test.ts` sibling and missin
 
 ### ✅ Checkpoint F — Test coverage
 
-- [ ] All untested `lib/` source files have a sibling `.test.ts` (or an explicit deferral note)
-- [ ] At least one integration test exercises the real BullMQ wire
-- [ ] E2E posture decided and either implemented or explicitly deferred with rationale
+- [x] All untested `lib/` source files have a sibling `.test.ts` (or an explicit deferral note) — `lib/api-client.test.ts` added 2026-05-11. Three files are deliberately not tested: `lib/types.ts` (type declarations only, no runtime), `lib/sleep.ts` (one-line `setTimeout` wrapper — testing `Promise<void>` resolution adds noise without signal), `lib/test-helpers.ts` (test-only scaffolding, exercised transitively by every DB-touching test).
+- [x] At least one integration test exercises the real BullMQ wire — T30 (`tests/integration/cpu-dispatch-pipeline.test.ts`)
+- [x] E2E posture decided and either implemented or explicitly deferred with rationale — T32/T33 + ADR-0002 (option c), `pnpm e2e` runs the scripted happy path
 - [x] Frontend test posture decided and either implemented or explicitly deferred with rationale — ADR-0003 (deferred)
-- [ ] `pnpm test` green
-- [ ] `pnpm typecheck` green
+- [x] `pnpm test` green — 31 files / 245 tests, 2026-05-11
+- [x] `pnpm typecheck` green — 2026-05-11
 - [ ] Human review
