@@ -128,8 +128,8 @@ Audit performed 2026-05-11. Source files without a `.test.ts` sibling and missin
 
 ### Integration-layer gaps
 
-- [ ] **T30** — Real-Redis dispatch pipeline test: enqueue via `scheduler.dispatchCpu` against a real BullMQ instance (test Redis db index), drain via `worker.claimTask`, assert lease acquisition + task completion. Highest-value missing test; the in-memory queue in `lease-fencing.test.ts` does not prove the wire works. — M
-- [ ] **T31** — Chaos injection end-to-end: with `CHAOS_CPU_CRASH_RATE`/`CHAOS_SSH_TIMEOUT_RATE`/`CHAOS_SSH_MISSING_ARTIFACT_RATE` > 0, assert the corresponding failure modes surface in `jobs` rows (not just that the unit-level chaos helpers fire). — S
+- [x] **T30** — Real-Redis dispatch pipeline test: enqueue via `scheduler.dispatchCpu` against a real BullMQ instance (test Redis db index), drain via `worker.claimTask`, assert lease acquisition + task completion. Highest-value missing test; the in-memory queue in `lease-fencing.test.ts` does not prove the wire works. — M — `tests/integration/cpu-dispatch-pipeline.test.ts`; isolates Redis on `TEST_REDIS_DB` (default 15, refuses db 0); skips at runtime if Redis is unreachable
+- [x] **T31** — Chaos injection end-to-end: with `CHAOS_CPU_CRASH_RATE`/`CHAOS_SSH_TIMEOUT_RATE`/`CHAOS_SSH_MISSING_ARTIFACT_RATE` > 0, assert the corresponding failure modes surface in `jobs` rows (not just that the unit-level chaos helpers fire). — S — `tests/integration/chaos-pipeline.test.ts`; mocks `getConfig` to re-parse `process.env` per call so each test can flip exactly one rate; uses real `runSshTask`/`defaultSshWork` and real `runCpuWork` (spying `process.exit`) plus the lease reaper
 
 ### E2E gaps (none today)
 
