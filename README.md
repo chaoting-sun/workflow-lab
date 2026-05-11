@@ -26,7 +26,7 @@ flowchart TB
 
     UI <--> DB
     Scheduler <--> DB
-    Scheduler -->|enqueue {taskId, leaseToken, attempts}| Queue
+    Scheduler -->|"enqueue {taskId, leaseToken, attempts}"| Queue
     Queue --> CPU
     Queue --> IO
     CPU -->|claim · heartbeat · finalize| DB
