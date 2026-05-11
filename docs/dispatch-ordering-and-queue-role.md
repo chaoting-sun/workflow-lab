@@ -64,8 +64,8 @@ long before any worker touches it.
 
 ## Why the order matters: fairness needs live counts
 
-The fairness ordering at `lib/scheduler.ts:50-60` looks like this in plain
-language:
+The fairness ordering in `reserveOneTask` (`lib/scheduler.ts`) looks like this
+in plain language:
 
 > Among all `pending` tasks of this kind, prefer the one whose **user** currently
 > has the fewest active leases. Break ties by which **job** has fewest active
@@ -182,7 +182,7 @@ under a slot cap".
 ## Consequence: the queue is reduced to a transport
 
 A second observation falls out of all of this. Look at what `dispatchKind`
-does each tick (`lib/scheduler.ts:115-126`):
+does each tick (`lib/scheduler.ts`):
 
 ```
 free = slotsCap - countActiveLeases(kind)
@@ -256,7 +256,7 @@ The trade-off is honest. By committing the lease before the publish, a failure
 between commit and `bullmq.add` (process crash, Redis blip throwing from
 `add`) leaves the row as `queued` with an active lease but no broker
 message. The reaper catches it on lease expiry and resets to `pending`
-(`lib/scheduler.ts:146-212`).
+(`reapExpiredLeases` in `lib/scheduler.ts`).
 
 Cost: one full `LEASE_TTL_MS` of recovery latency, during which one slot is
 unusable.

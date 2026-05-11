@@ -17,8 +17,8 @@
 //   pnpm supervisor:logs
 //
 // Tunables:
-//   GLOBAL_CPU_SLOTS      — number of cpu worker replicas (default 18)
-//   IO_WORKER_REPLICAS    — number of io worker replicas (default 1)
+//   GLOBAL_CPU_SLOTS      — number of cpu worker replicas (default 4)
+//   IO_WORKER_REPLICAS    — number of io worker replicas (default 4)
 
 const fs = require("node:fs");
 const path = require("node:path");

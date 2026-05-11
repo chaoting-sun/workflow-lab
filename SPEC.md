@@ -1,6 +1,8 @@
 # Workflow Lab — Specification
 
-## 1. Objective
+## Goal and scope
+
+### 1. Objective
 
 Build a simulated job-orchestration system that demonstrates **fair multi-user scheduling** under a bounded global resource pool. The point is not the work itself (CPU / SSH / training are all simulated with `sleep` + fake files) — the point is to learn how a scheduler enforces fairness across users when a single FIFO queue would not.
 
@@ -10,7 +12,7 @@ Build a simulated job-orchestration system that demonstrates **fair multi-user s
 
 ---
 
-## 2. Scope (one feature only)
+### 2. Scope (one feature only)
 
 A user submits a **job**. The system produces **N pipelines per job** (default 200, configurable via `PIPELINES_PER_JOB` env var). Each pipeline is:
 
@@ -25,17 +27,19 @@ Out of scope: real SSH, real ML training, retries, auth, persistence beyond Post
 
 ---
 
-## 3. Architecture
+## System design
 
-### 3.1 Components
+### 3. Architecture
+
+#### 3.1 Components
 
 | Component | Responsibility |
 |---|---|
 | **Next.js app** | API routes (`/api/jobs`, `/api/jobs/:id`) + dashboard UI |
-| **Postgres** | Source of truth: `users`, `jobs`, `tasks`, `artifacts`, `leases` |
+| **Postgres** | Source of truth: `users`, `jobs`, `tasks` (lease state lives on `tasks`), `artifacts` |
 | **Redis + BullMQ** | Execution delivery only — `cpu`, `ssh`, `training` queues |
-| **Scheduler** | Periodic loop: picks pending tasks fairly, creates leases, enqueues to BullMQ |
-| **Worker process** | Single Node process running BullMQ workers for all three queues |
+| **Scheduler process** | Single replica. Holds the advisory lock (§3.9). Periodic loop: picks pending tasks fairly, stamps a fresh lease onto the task row, enqueues to BullMQ. |
+| **Worker processes** | Replicated. `WORKER_ROLE=cpu` runs the CPU BullMQ worker (one process per CPU slot, in-process concurrency 1). `WORKER_ROLE=io` runs SSH + training BullMQ workers with higher in-process concurrency. See §13 for the rationale. |
 
 ```mermaid
 flowchart LR
@@ -43,22 +47,28 @@ flowchart LR
     Dashboard[Dashboard UI] -->|poll 1s| API
     API -->|insert job + N pending CPU tasks| DB[(Postgres<br/>source of truth)]
 
-    subgraph WorkerProcess["Worker process (single Node)"]
+    subgraph SchedulerProcess["Scheduler process (1× replica, holds advisory lock)"]
         Scheduler{{"Scheduler tick (1s)<br/>fairness policy"}}
+    end
+
+    subgraph WorkerCpu["worker:cpu (N× replicas, concurrency=1)"]
         CPUWorker[CPU worker]
+    end
+
+    subgraph WorkerIo["worker:io (1–2× replicas, high concurrency)"]
         SSHWorker[SSH worker]
         TrainWorker[Training worker]
     end
 
-    Scheduler -->|"0- reap expired leases (reset to pending or fail)<br/>1- backpressure check (SSH backlog)<br/>2- pick fairest user (running_cpu_count, job age)<br/>3- create lease w/ expires_at"| DB
-    Scheduler -->|"4- enqueue {taskId, leaseId, attempts}"| Redis[(Redis + BullMQ<br/>delivery only)]
+    Scheduler -->|"0- reap expired leases (reset to pending or fail)<br/>1- backpressure check (SSH backlog)<br/>2- pick fairest user (per-user / per-job active leases)<br/>3- stamp lease onto task row + status=queued"| DB
+    Scheduler -->|"4- enqueue {taskId, leaseToken, attempts}"| Redis[(Redis + BullMQ<br/>delivery only)]
 
     Redis -->|cpu queue| CPUWorker
     Redis -->|ssh queue| SSHWorker
     Redis -->|training queue| TrainWorker
 
-    CPUWorker -->|"sleep 3-5s<br/>(heartbeat lease)<br/>(maybe crash)"| Artifacts[/artifacts/*.cpu/]
-    CPUWorker -->|"release lease OR mark pending/failed<br/>insert pending SSH task"| DB
+    CPUWorker -->|"sleep 3-5s in worker_thread<br/>(heartbeat bumps lease_expires_at)<br/>(maybe crash)"| Artifacts[/artifacts/*.cpu/]
+    CPUWorker -->|"clear lease_token OR mark pending/failed<br/>insert pending SSH task"| DB
 
     SSHWorker -->|"Promise.race(sleep 1s, timeout)<br/>(maybe miss artifact)"| Artifacts2[/artifacts/*.ssh/]
     SSHWorker -->|"verify artifact on disk<br/>if N SSH succeeded WITH file: insert training task"| DB
@@ -74,7 +84,7 @@ flowchart LR
 
 Key separation: **DB holds policy state (pending tasks, leases)**; **Redis only delivers already-decided work**. The scheduler is the single point where fairness is enforced.
 
-### 3.2 Critical design rule
+#### 3.2 Critical design rule
 
 **DB is source of truth. BullMQ is delivery, not policy.**
 
@@ -88,62 +98,45 @@ scheduler tick (every 1s)  →  find active users → pick user with fewest runn
 cpu worker                 →  sleep 3-5s → write artifact file → release lease
                               → insert pending SSH task in DB
 ssh worker                 →  sleep 1s → write result file → release lease (if SSH leased)
-                              → if all N SSH results exist for the job → insert training task
+                              → if N artifact rows exist for this job's SSH tasks → insert training task
 training worker            →  sleep 5s → mark job done
 ```
 
-### 3.3 Fairness algorithm
+#### 3.3 Fairness algorithm
 
-Two distinct counts (do not confuse them):
+Three distinct counts of "active leases" feed the fairness decision (do not confuse them):
 
-- `used` — **global**: total active CPU leases across all users. Gates how many slots are free this tick.
-- `running_cpu_count(u)` — **per-user**: that user's active CPU leases. Used only to rank users for the next slot.
+- **Global active count of a kind** — total active leases of that kind across all users. Gates how many slots are free this tick (`free = GLOBAL_*_SLOTS − used`).
+- **Per-user active count of a kind** — that user's currently-leased tasks of the given kind. The primary fairness key.
+- **Per-job active count of a kind** — that job's currently-leased tasks of the given kind. The secondary fairness key, used so two concurrent jobs from the same user interleave instead of the older job draining before the newer one starts.
 
-Relationship: `used = Σ running_cpu_count(u)` over all users.
+By construction, the global count equals the sum of all per-user counts, and a user's count equals the sum of that user's per-job counts. An "active lease" means a `tasks` row with `lease_token IS NOT NULL` (§3.4) — there is no separate leases table.
 
-```
-GLOBAL_CPU_SLOTS = 20
+**Per-tick procedure** (single scheduler instance, see §3.9):
 
-every 1s (single scheduler instance — see §3.9):
-  reap_expired_leases()                  // §3.6
-  if ssh_backlog >= SSH_BACKPRESSURE_THRESHOLD: skip CPU dispatch  // §3.8
+1. Reap expired leases (§3.6).
+2. Apply backpressure: if the SSH backlog is at or above threshold, skip CPU dispatch this tick (§3.8). SSH and training dispatch always run.
+3. For each kind in turn, compute `free = GLOBAL_*_SLOTS − active_count(kind)`. If `free ≤ 0`, skip this kind.
+4. Otherwise, repeat up to `free` times: pick the fairest pending task of this kind (criteria below), and in **one atomic step** flip it from `pending` to `queued`, stamp a fresh `lease_token`, set `lease_expires_at = now() + LEASE_TTL_MS`, and set `lease_heartbeat_at = now()`. Then enqueue `{taskId, leaseToken, attempts}` to the BullMQ queue **outside** the DB transaction.
 
-  used = count(leases where resource='cpu' and released_at is null)
-  free = GLOBAL_CPU_SLOTS - used
-  if free <= 0: return
+**The atomicity matters**: the pick and the lease stamp are a single statement. After it commits, the very next pick within the same tick sees the just-stamped row in the active counts, so the second decision is made against fresh state. Without that property the scheduler could hand all `free` slots to the same user before any of them is reflected in the counts.
 
-  for _ in range(free):
-    -- one SQL: pick user + their oldest pending task in one go
-    SELECT t.id AS task_id, t.user_id, j.created_at AS job_created_at,
-           (SELECT count(*) FROM leases l
-              WHERE l.user_id=t.user_id AND l.resource='cpu' AND l.released_at IS NULL
-           ) AS running_cpu_count
-      FROM tasks t
-      JOIN jobs j ON j.id = t.job_id
-      WHERE t.kind='cpu' AND t.status='pending'
-      ORDER BY running_cpu_count ASC, j.created_at ASC, t.created_at ASC
-      LIMIT 1
-      FOR UPDATE OF t SKIP LOCKED;
+**Pick criterion (4-level tie-break)**, applied against the live active counts:
 
-    if no row: break
-    INSERT lease (task_id, user_id, resource='cpu', expires_at=now()+LEASE_TTL_MS)
-    UPDATE task SET status='queued'
-    COMMIT
-    bullmq.cpu.add({ taskId, leaseId, attempts: task.attempts })   // outside tx
-```
+1. **Smallest per-user active count** (of this kind) for the candidate's user — cross-user fairness.
+2. **Smallest per-job active count** (of this kind) for the candidate's job — same-user fairness across concurrent jobs.
+3. **Oldest `jobs.created_at`** — when both counts tie, the older job wins.
+4. **Oldest `tasks.created_at`** — FIFO within a job.
 
-**Tie-break order**:
-1. Smaller `running_cpu_count` (fairness across users).
-2. Smaller `jobs.created_at` of the candidate task's job (older job wins — fairness across the same user's queued jobs).
-3. Smaller `tasks.created_at` (FIFO within a job).
+Concurrency between scheduler decision and parallel writers (heartbeats, finalizes, the reaper) is handled by row-level locking with `SKIP LOCKED` on the candidate row: a row currently being mutated by another transaction is skipped, the next-best candidate is considered, and no decision is delayed waiting on a lock.
 
-**Within-user FIFO**: a single user's tasks are processed in `created_at` order across their jobs (earliest job's tasks drain before later jobs). This is intentional — fairness is across users, not across one user's own backlog.
+**Same-user, multiple jobs**: tasks **interleave** across that user's jobs rather than draining the oldest job to completion before the next one starts. With one user holding two jobs and `GLOBAL_CPU_SLOTS=4`, the steady-state allocation is ~2 slots per job, not 4-then-4. This is intentional: it keeps a long-running job from blocking a smaller follow-up the same user submits.
 
-**Crash safety of dispatch**: if the scheduler process dies between `COMMIT` and `bullmq.cpu.add`, the task is left as `status='queued'` with an active lease but no BullMQ message. The lease will expire after `LEASE_TTL_MS`, the reaper resets to `pending`, and the next tick re-dispatches. No special handling needed.
+**Crash safety of dispatch**: if the scheduler process dies between the dispatch `UPDATE` (which has committed) and `bullmq.cpu.add`, the task is left as `status='queued'` with `lease_token` set but no BullMQ message. The lease expires after `LEASE_TTL_MS`, the reaper resets the task to `pending` (clearing `lease_token`), and the next tick re-dispatches. No special handling needed.
 
-SSH tasks: same pattern with `GLOBAL_SSH_SLOTS` (default 40). Training tasks: `GLOBAL_TRAINING_SLOTS` (default 4). SSH and training dispatch are **not** affected by the CPU backpressure gate.
+SSH and training tasks use the same algorithm with `GLOBAL_SSH_SLOTS` and `GLOBAL_TRAINING_SLOTS`. SSH and training dispatch are **not** affected by the CPU backpressure gate.
 
-### 3.4 Data model
+#### 3.4 Data model
 
 ```sql
 users        (id, name, created_at)
@@ -156,208 +149,140 @@ jobs         (id, user_id, status, pipelines_count,
 
 tasks        (id, job_id, user_id, kind, status, parent_task_id,
               attempts, max_attempts, failure_reason,
+              lease_token, lease_expires_at, lease_heartbeat_at,
               created_at, started_at, finished_at)
               -- kind: 'cpu' | 'ssh' | 'training'
               -- status: 'pending' | 'queued' | 'running' | 'succeeded' | 'failed'
               -- attempts: int, default 0; incremented atomically when a worker claims it
               -- max_attempts: int, default 3
               -- failure_reason: nullable text ('crash' | 'timeout' | 'missing_artifact' | ...)
+              --
+              -- Lease state (consolidated onto the task — there is no separate
+              -- leases table; see ADR-0001):
+              --   lease_token        uuid, NULL when no current owner.
+              --                      The single source of truth for "active lease".
+              --   lease_expires_at   timestamptz; reaper triggers when this < now()
+              --                      while the task is still in ('queued','running').
+              --   lease_heartbeat_at timestamptz; bumped by the worker every
+              --                      LEASE_HEARTBEAT_MS while the task is running.
+              --
               -- UNIQUE INDEX (parent_task_id) WHERE kind='ssh'
               --   → guarantees at most one SSH child per CPU parent (§E1)
 
 artifacts    (id, task_id, path, created_at)
               -- UNIQUE (task_id) → at most one artifact per task; barrier counts this table
-
-leases       (id, task_id, user_id, resource,
-              acquired_at, heartbeat_at, expires_at, released_at)
-              -- resource: 'cpu' | 'ssh' | 'training'
-              -- expires_at: now() + LEASE_TTL_MS at acquisition; bumped by heartbeat
-              -- a lease is "expired" when expires_at < now() AND released_at IS NULL
 ```
 
 A pipeline is identified by chaining `parent_task_id`: SSH task's parent = its CPU task; training task has no parent (gated by job-level barrier).
+
+**Why the lease lives on `tasks` instead of a separate table** (ADR-0001): every lease operation (acquire, heartbeat, release, reap) already touches the task row, and a 1:1 child table only added a join with no semantic gain. The `tasks.lease_token IS NOT NULL` predicate is the single, indexable fact "this task currently has an owner". Sparse partial indexes on `(kind, user_id) WHERE lease_token IS NOT NULL` and `(kind, job_id) WHERE lease_token IS NOT NULL` make the §3.3 fairness count subqueries cheap.
+
+**Why `parent_task_id` is `ON DELETE SET NULL`**: deleting a CPU parent leaves its SSH child orphaned but distinguishable. The "exactly one SSH child per CPU parent" invariant from `tasks_ssh_parent_unique_idx` therefore only holds while the parent exists; in the lab we never delete tasks, so the invariant is effectively absolute.
 
 **Why `artifacts` has `UNIQUE (task_id)`**: a retried task (e.g. training that timed out and got reset to pending) must not produce two artifact rows. The second insert fails → optimistic-lock branch handles it (see §3.7).
 
 **Why `jobs.pipelines_count`**: changing `PIPELINES_PER_JOB` between jobs would otherwise corrupt the barrier comparison for in-flight jobs. Snapshot at creation is the only safe option.
 
-### 3.5 Barrier check
+#### 3.5 Barrier check
 
-The `artifacts` table is the single source of truth for "did this SSH task actually produce a result". The SSH worker only inserts an `artifacts` row **after** verifying the file exists on disk (§3.7). Therefore the barrier never needs to do filesystem IO inside a DB transaction — it just counts artifact rows.
+The `artifacts` table is the single source of truth for "did this SSH task actually produce a result". The SSH worker only inserts an `artifacts` row **after** verifying the file exists on disk (§3.7). Therefore the barrier never needs to do filesystem IO — it just counts artifact rows.
 
-When an SSH task transitions to `succeeded` (i.e. the artifact row was just inserted), in the same DB transaction:
+When an SSH task transitions to `succeeded` (i.e. the artifact row has just been inserted), the barrier runs **in the same DB transaction as the success finalize**, in this order:
 
-```sql
-BEGIN;
-  -- serialise concurrent finishers of the same job
-  SELECT pipelines_count FROM jobs WHERE id = $jobId FOR UPDATE;
+1. **Serialise concurrent finishers of the same job.** Take a row-level lock on the parent job row. Any other SSH worker in the same job that reaches the barrier at the same time blocks here until the first finisher commits. Without this lock, two finishers could both observe `done == pipelines_count` and both insert a training task.
+2. **Count completed SSH artifacts of this job.** Join the `artifacts` table to the SSH tasks of this job and count.
+3. **Decide whether to fan out to training.** If the count equals the job's snapshotted `pipelines_count` *and* no training task has been inserted yet for this job, insert a single `pending` training task. The "no training task yet" guard is the second line of defence, idempotent against any path that might re-enter the barrier (retries, races the lock didn't quite cover).
 
-  done := SELECT count(*) FROM artifacts a
-            JOIN tasks t ON t.id = a.task_id
-            WHERE t.job_id = $jobId AND t.kind = 'ssh';
+**Why on-disk verification lives in the worker, not the barrier:** keeping filesystem IO out of the barrier transaction means the barrier holds a DB lock only for the time it takes to count rows and decide. Filesystem latency never blocks other finishers.
 
-  IF done = jobs.pipelines_count
-     AND NOT EXISTS (SELECT 1 FROM tasks WHERE job_id=$jobId AND kind='training') THEN
-    INSERT INTO tasks (job_id, user_id, kind, status, max_attempts)
-    VALUES ($jobId, $userId, 'training', 'pending', $MAX_ATTEMPTS);
-  END IF;
-COMMIT;
-```
+#### 3.6 Lease lifecycle & reaper
 
-`FOR UPDATE` on the job row, plus the `NOT EXISTS` guard, makes training-task insertion idempotent under concurrent SSH finishers.
+Leases are how the scheduler counts "currently running" without trusting workers to be alive. The lease is three columns on the task row (§3.4): `lease_token`, `lease_expires_at`, `lease_heartbeat_at`. `lease_token IS NOT NULL` ↔ the task is owned by some worker right now.
 
-**On-disk verification** is the SSH worker's job (§3.7), not the barrier's. Splitting them this way keeps the barrier transaction pure SQL — no filesystem IO inside a DB lock.
+- **Acquire** — the scheduler's dispatch step (§3.3) atomically flips the task from `pending` to `queued`, stamps a fresh random `lease_token`, sets `lease_expires_at = now() + LEASE_TTL_MS`, and sets `lease_heartbeat_at = now()` in a single statement.
+- **Heartbeat** — while the task is running, the worker periodically (every `LEASE_HEARTBEAT_MS`, default 5s) bumps both `lease_heartbeat_at` and `lease_expires_at`. The bump is gated on the worker's own `lease_token`: if the lease has been released or replaced (token nulled or rotated by a re-dispatch), the heartbeat is a silent no-op. A stale heartbeat from an abandoned attempt cannot resurrect a released lease.
+- **Release** — on success, on terminal failure, or on a retryable failure (resetting the task to `pending`), the worker NULLs all three lease columns in the same UPDATE that writes the new status. Lease release and status change are never two separate writes.
+- **Reap** — at the start of every scheduler tick, before dispatch, the scheduler scans for tasks whose `lease_expires_at` has slipped past `now()` while still in status `queued` or `running`. An expired lease means the worker stopped heartbeating (process crash, hang, GC stall longer than the TTL). For each expired row:
+  - **Retryable** (`attempts < max_attempts`): status reset to `pending`, `started_at` cleared, all three lease columns nulled. The task becomes available for re-dispatch on the next tick.
+  - **Terminal** (attempts exhausted): status set to `failed` with `failure_reason='lease_expired'`, `finished_at` stamped, lease columns nulled. The job-level failure is propagated as well (§3.7).
+  Concurrency with parallel reapers / workers is handled by `SKIP LOCKED` on the row scan, so contention never blocks the tick.
 
-### 3.6 Lease lifecycle & reaper
+The reaper runs **inside the scheduler tick**, not as a separate process — keeping all policy decisions in one place.
 
-Leases are how the scheduler counts "currently running" without trusting workers to be alive.
+**`attempts` is not bumped by the reaper** — the next claim does that. If both the reaper and the claim bumped, an honest worker that resumes after a brief pause and still finalizes successfully (passing the optimistic-lock check, §3.7) would be charged one extra attempt against `max_attempts`. As a side effect, a full `running → pending → queued` cycle preserves `attempts`, which is the diagnostic fingerprint described in `docs/task-lifecycle.md`.
 
-- **Acquire**: scheduler creates lease with `expires_at = now() + LEASE_TTL_MS` (default 30s).
-- **Heartbeat**: worker updates `heartbeat_at = now(), expires_at = now() + LEASE_TTL_MS` every `LEASE_HEARTBEAT_MS` (default 5s) while the task is running.
-- **Release**: worker sets `released_at = now()` on success or graceful failure.
-- **Reap**: each scheduler tick, before dispatching, run:
-  ```sql
-  -- expired leases = worker crashed or hung
-  SELECT task_id FROM leases
-    WHERE released_at IS NULL AND expires_at < now()
-    FOR UPDATE SKIP LOCKED;
-  -- for each: mark task back to pending if attempts < max_attempts, else failed.
-  --          set lease.released_at = now() with a marker.
-  ```
+#### 3.7 Failure semantics
 
-The reaper runs in the same scheduler tick — no separate process. This keeps "policy" in one place.
+Every worker handler follows the same contract. The BullMQ message is a tuple `(taskId, leaseToken, attempts)` — the lease token issued by the scheduler at dispatch and the attempt count at the moment of dispatch. The worker treats that tuple as a fencing token: it must still be authoritative at every DB write, otherwise the write becomes a silent no-op.
 
-### 3.7 Failure semantics
+The handler runs through these phases:
 
-Every worker wraps its handler in this skeleton. The key idea: the worker **claims** the task atomically using the `leaseId` it received via the BullMQ message. If the claim fails (e.g. reaper already reset this task and a new lease was issued), the worker silently aborts — no writes, no side effects.
+**1. Atomic claim.** The first DB write is a single conditional UPDATE that flips the task from `queued` to `running`, stamps `started_at`, and increments `attempts` — gated on **all three** of: matching `id`, current `status='queued'`, current `lease_token` equal to the message's token, and current `attempts` equal to the message's attempts. If zero rows update, the worker silently aborts with no side effects. Three independent races are closed by this guard:
 
-```ts
-// BullMQ payload: { taskId, leaseId, attempts: expectedAttempts }
-async function runTask({ taskId, leaseId, attempts: expectedAttempts }, kind) {
-  // 1. Atomic claim. The compound WHERE makes this a no-op if:
-  //    - task was already reset by reaper (status != 'queued')
-  //    - task already claimed by a parallel worker (attempts moved on)
-  //    - lease was already released (someone else won)
-  const claim = await db.query(`
-    UPDATE tasks
-       SET status='running', started_at=now(), attempts=attempts+1
-     WHERE id=$1 AND status='queued' AND attempts=$2
-       AND EXISTS (SELECT 1 FROM leases
-                   WHERE id=$3 AND task_id=$1 AND released_at IS NULL)
-     RETURNING attempts
-  `, [taskId, expectedAttempts, leaseId])
-  if (claim.rowCount === 0) return  // stale message, abort cleanly
+- The reaper already reset the task while the message was sitting in BullMQ (status no longer `queued`, lease_token NULLed).
+- A parallel worker already claimed it (attempts moved on).
+- The lease was reaped *and* re-dispatched, so a different `lease_token` is now on the row (the new dispatch's message will succeed, this stale one won't).
 
-  const myAttempts = claim.rows[0].attempts
-  startHeartbeat(leaseId)           // setInterval: UPDATE leases SET expires_at=now()+TTL WHERE id=leaseId AND released_at IS NULL
+**2. Heartbeat.** Once the claim returns, the worker starts a periodic heartbeat on the lease (§3.6). The heartbeat is itself gated on `lease_token`, so once the worker releases or the row is reaped, it becomes a no-op without needing explicit cancellation.
 
-  try {
-    await Promise.race([
-      doWork(taskId),               // sleep + write file (chaos may inject crash/timeout/skip-write)
-      timeoutAfter(TASK_TIMEOUT_MS[kind]),
-    ])
+**3. Run work under a timeout.** The worker races `doWork(taskId)` against a per-kind timeout (`CPU_TIMEOUT_MS` / `SSH_TIMEOUT_MS` / `TRAINING_TIMEOUT_MS`). On timeout, the timeout branch throws — the same path as any other `doWork` exception. `doWork` is the only place chaos can be injected (crash, late completion, missing-artifact); anything outside `doWork` runs unconditionally.
 
-    // Verify on-disk artifact BEFORE inserting artifact row (filesystem IO outside tx).
-    if (kind !== 'training') {
-      const path = artifactPath(taskId, kind)
-      await fs.access(path)         // throws → caught below
-    }
+**4. Verify the artifact on disk** (CPU and SSH only). After `doWork` resolves, but **before** any DB write, the worker checks that the artifact file actually exists at the deterministic path for this task. A missing file (e.g. chaos `MISSING_ARTIFACT` or a buggy worker) raises an error and goes through the failure path. Filesystem IO never happens inside a DB transaction.
 
-    await db.tx(async (tx) => {
-      // Optimistic lock: only proceed if our attempt is still authoritative.
-      const upd = await tx.query(`
-        UPDATE tasks SET status='succeeded', finished_at=now()
-         WHERE id=$1 AND attempts=$2 AND status='running' RETURNING id
-      `, [taskId, myAttempts])
-      if (upd.rowCount === 0) throw new StaleAttemptError()  // rollback, no side effects
+**5. Finalize success in one transaction.** Inside one DB transaction:
 
-      await tx.query(`INSERT INTO artifacts (task_id, path) VALUES ($1, $2)
-                      ON CONFLICT (task_id) DO NOTHING`, [taskId, path])
-      await tx.query(`UPDATE leases SET released_at=now() WHERE id=$1`, [leaseId])
+- An optimistic-lock UPDATE flips the task from `running` to `succeeded`, stamps `finished_at`, and NULLs all three lease columns — gated on `attempts = myAttempts` (the value returned by the claim). If zero rows update, the worker raises a `StaleAttemptError` and the transaction rolls back, leaving no artifact row, no child task, and no barrier side effect. The optimistic lock prevents a slow worker from overwriting a task that the reaper has already reset and a second worker has already finished.
+- The artifacts row is inserted with `ON CONFLICT (task_id) DO NOTHING` — idempotent under retries that wrote the file before failing.
+- A kind-specific side effect runs: CPU inserts the child SSH task (idempotent via `UNIQUE (parent_task_id)`); SSH runs the barrier check (§3.5); training marks the job completed (idempotent via `WHERE status NOT IN ('completed','failed')`).
 
-      if (kind === 'cpu')      await insertChildSshTask(tx, taskId)        // ON CONFLICT DO NOTHING via UNIQUE (parent_task_id)
-      if (kind === 'ssh')      await runBarrierCheck(tx, jobId, userId)    // §3.5
-      if (kind === 'training') await markJobCompleted(tx, jobId)           // UPDATE WHERE status != 'completed'
-    })
-  } catch (err) {
-    if (err instanceof StaleAttemptError) return  // already handled
+If any step in the success transaction fails, all of it rolls back together.
 
-    await db.tx(async (tx) => {
-      const reason = err.kind ?? 'error'         // 'timeout' | 'missing_artifact' | ...
-      const retryable = myAttempts < task.max_attempts
-      const upd = await tx.query(`
-        UPDATE tasks
-           SET status = $2,
-               failure_reason = $3,
-               finished_at = $4
-         WHERE id=$1 AND attempts=$5 AND status='running' RETURNING id
-      `, [taskId,
-          retryable ? 'pending' : 'failed',
-          reason,
-          retryable ? null : 'now()',
-          myAttempts])
-      if (upd.rowCount === 0) return              // reaper got there first; nothing to do
+**6. Finalize failure in one transaction** (any thrown error from steps 3–5, except `StaleAttemptError` which is already handled). The worker classifies retryability by comparing `myAttempts` to `max_attempts`:
 
-      await tx.query(`UPDATE leases SET released_at=now() WHERE id=$1 AND released_at IS NULL`, [leaseId])
+- A retryable failure resets the task to `pending`, records `failure_reason`, and NULLs the lease columns. The next scheduler tick can re-dispatch it.
+- A terminal failure flips the task to `failed`, stamps `finished_at`, records the reason, NULLs the lease columns, **and** propagates job-level failure: the parent job is marked `failed` (idempotent guard against already-failed/completed jobs).
 
-      // Permanent failure of any leaf task fails the whole job (§E4).
-      if (!retryable) {
-        await tx.query(`UPDATE jobs SET status='failed', completed_at=now()
-                        WHERE id=$1 AND status NOT IN ('completed','failed')`, [jobId])
-      }
-    })
-  } finally {
-    stopHeartbeat(leaseId)
-  }
-}
-```
+Both branches use the same optimistic-lock guard (`attempts = myAttempts AND status = 'running'`). If zero rows update, the reaper got there first — nothing to do, the failure record the reaper wrote (`failure_reason='lease_expired'` or similar) is the authoritative one.
 
-A worker process **crash** (`process.exit`) skips both branches; the lease's `expires_at` is no longer being heartbeated; the reaper claims it on the next tick and resets the task to `pending` (or `failed` if attempts exhausted).
+**7. Stop the heartbeat** unconditionally on the way out, success or failure.
 
-**Why the optimistic lock matters**: without `WHERE attempts=$myAttempts`, a slow worker could overwrite a task that has already been reset by the reaper and re-dispatched to a second worker — producing duplicate artifacts and duplicate SSH children.
+**Process-crash path.** A hard crash (`process.exit`, kernel kill, OS panic) skips steps 5–7 entirely. The heartbeat stops automatically because the process is gone, `lease_expires_at` slips past `now()` after one TTL, and the reaper claims the row on its next tick — same outcome as a retryable failure, just driven by the scheduler instead of the worker.
 
-**Job failure propagation**: when any CPU/SSH/training task hits permanent `failed`, the job is marked `failed` immediately. Other tasks of the same job that are already running are allowed to finish naturally (no cancellation) — they just won't trigger the barrier.
+**Why the optimistic lock is non-negotiable.** Without `WHERE attempts = $myAttempts`, a slow worker that finishes after its lease has been reaped and re-dispatched would overwrite the second worker's authoritative state — producing duplicate artifact rows, duplicate SSH children, or a "succeeded" status on a task whose new attempt is still running.
 
-### 3.8 Backpressure (CPU → SSH)
+**Job failure propagation rule.** When any CPU/SSH/training task hits permanent `failed`, the parent job is marked `failed` immediately so downstream consumers stop waiting on a barrier that can never fire. Sibling tasks of the same job that are already running are *not* cancelled — they run to natural completion. They simply will not trigger the barrier (success of the failed sibling never happens) or anything else, because the job's terminal status is already set.
 
-CPU tasks produce SSH tasks. If SSH workers are slow or `GLOBAL_SSH_SLOTS` is small, SSH pending tasks pile up. The scheduler must not blindly keep producing more.
+#### 3.8 Backpressure (CPU → SSH)
 
-Before dispatching CPU tasks each tick:
+CPU tasks produce SSH tasks. If SSH workers are slow or `GLOBAL_SSH_SLOTS` is small, SSH-side work piles up while CPU work keeps inserting more SSH tasks. The scheduler must not blindly keep producing.
 
-```ts
-ssh_backlog = SELECT count(*) FROM tasks
-              WHERE kind='ssh' AND status IN ('pending','queued','running')
-if ssh_backlog >= SSH_BACKPRESSURE_THRESHOLD:
-  skip CPU dispatch this tick   // SSH queue still drains independently
-```
+The rule, applied each tick before CPU dispatch: count the SSH backlog as the total number of SSH tasks in any non-terminal state (`pending`, `queued`, or `running`). If that count is at or above `SSH_BACKPRESSURE_THRESHOLD`, skip CPU dispatch for this tick. SSH dispatch and training dispatch are unaffected — only CPU is paused, so the SSH queue continues to drain. Once the backlog drops back below the threshold, CPU dispatch resumes on the next tick.
 
-`SSH_BACKPRESSURE_THRESHOLD` default: `2 × GLOBAL_SSH_SLOTS` (e.g. 80). SSH and training scheduling are unaffected — only CPU is paused.
+`SSH_BACKPRESSURE_THRESHOLD` rule of thumb: `2 × GLOBAL_SSH_SLOTS` (with the default `GLOBAL_SSH_SLOTS=4`, the threshold is 8).
 
-**Trade-off (intentional)**: backpressure is **global**, not per-user. If alice's SSH tasks fill the backlog, carol's CPU tasks are also paused even though carol isn't responsible. This sacrifices strict fairness for system stability. If we let carol push more CPU tasks while the SSH queue is jammed, SSH backlog grows unbounded and breaks every user. Stability wins.
+**Trade-off (intentional): backpressure is global, not per-user.** If alice's SSH tasks fill the backlog, carol's CPU tasks are also paused even though carol isn't responsible. This sacrifices strict cross-user fairness for system stability — if carol were allowed to push more CPU tasks while the SSH queue was jammed, the SSH backlog would grow unbounded and break every user. Stability wins over fairness in this one place, and only here.
 
-### 3.9 Single-instance guarantee
+#### 3.9 Single-instance guarantee
 
-The fairness, reaper, and backpressure logic all assume **exactly one scheduler instance** is ticking. Two parallel schedulers would compute `used` independently and over-allocate slots.
+The fairness algorithm (§3.3), the reaper (§3.6), and the backpressure check (§3.8) all assume **exactly one scheduler instance** is ticking. Two parallel schedulers would compute the active counts independently against an instant of DB state and could each decide to fill the same free slot, over-allocating against the global cap.
 
-On worker process startup, before the first scheduler tick:
+The guarantee is enforced via a Postgres advisory lock keyed on a fixed identifier (`workflow-lab:scheduler`). On scheduler-process startup, before the first tick, the process attempts to acquire this lock. If the lock is already held by another process, the attempt fails: the new process logs an error and exits with status 1. If acquired, the process holds the lock for its entire lifetime; Postgres releases it automatically when the holding connection closes (graceful shutdown or process death). This makes "single scheduler" a runtime invariant, not a polite assumption — a misconfigured deployment that tries to run two schedulers fails fast at boot.
 
-```sql
-SELECT pg_try_advisory_lock(hashtext('workflow-lab:scheduler'));
-```
+The single-instance rule applies only to the **scheduler tick loop**. Multiple BullMQ worker processes for the same kind are explicitly supported (and required, for CPU work — see §13).
 
-If the lock is not acquired, the process logs an error and exits 1. The lock is automatically released when the connection closes (process death). This makes "single scheduler" a runtime invariant, not a polite assumption.
-
-BullMQ workers themselves can be multiple within the same process — only the scheduler tick must be singular.
-
-### 3.10 BullMQ lock alignment
+#### 3.10 BullMQ lock alignment
 
 BullMQ has its own `lockDuration` (default 30s): if a worker holds a job longer than this, BullMQ assumes it died and re-delivers the job to another worker. If our task timeouts approach or exceed `lockDuration`, we get **double delivery** — same problem as a stale-message replay.
 
 Set BullMQ `lockDuration` ≥ `max(*_TIMEOUT_MS) + 5000` (e.g. 70s for a 60s training timeout). Workers extend the BullMQ lock alongside the DB lease heartbeat. Our atomic claim (§3.7) is the safety net if alignment is wrong, but alignment is the first line of defence.
 
+**Lease TTL is heartbeat-driven, not timeout-driven.** `LEASE_TTL_MS` (default 30s) is intentionally smaller than `TRAINING_TIMEOUT_MS` (default 60s) — the rule is "TTL ≥ heartbeat × ~6", not "TTL ≥ max timeout". A live worker bumps `lease_expires_at` every `LEASE_HEARTBEAT_MS`, so task duration can exceed TTL safely as long as heartbeats keep firing. The reaper only kicks in when heartbeats stop (crashed worker, blocked event loop), at which point reclaiming the slot quickly is the desired behaviour. BullMQ `lockDuration`, in contrast, must dominate the longest timeout because it is not heartbeated by the worker handler in the same way.
+
 ---
 
-## 4. API
+## Public surface
+
+### 4. API
 
 | Method | Path | Body | Returns |
 |---|---|---|---|
@@ -375,7 +300,7 @@ User identity: `userId` passed in request body / query. No auth.
 
 ---
 
-## 5. Frontend dashboard
+### 5. Frontend dashboard
 
 One page (`/`):
 - Form: pick user (or create new) → submit job
@@ -387,7 +312,9 @@ Production-quality enough to read at a glance; not pixel-perfect.
 
 ---
 
-## 6. Project structure
+## Operational layout
+
+### 6. Project structure
 
 ```
 workflow-lab/
@@ -400,14 +327,20 @@ workflow-lab/
     page.tsx                # dashboard
     components/
   lib/
-    db.ts                   # postgres client (pg or prisma)
+    db.ts                   # postgres client (pg)
     queues.ts               # BullMQ queue definitions
-    scheduler.ts            # fairness loop (importable; runs in worker process)
-    barrier.ts              # all-200-SSH-done check
+    scheduler.ts            # fairness loop (imported by scheduler/index.ts)
+    advisory-lock.ts        # pg_try_advisory_lock wrapper (§3.9)
+    barrier.ts              # all-N-SSH-done check
     config.ts               # env-driven knobs
+    worker.ts               # claim / heartbeat / finalize helpers
+  scheduler/
+    index.ts                # entrypoint: advisory lock + scheduler tick loop
   worker/
-    index.ts                # boots scheduler tick + 3 BullMQ workers
-    cpu.ts
+    index.ts                # entrypoint: BullMQ workers selected by WORKER_ROLE
+    role.ts                 # WORKER_ROLE → kinds mapping
+    cpu.ts                  # spawns cpu-thread worker_thread; finalizes
+    cpu-thread.ts           # synchronous compute, runs inside worker_threads.Worker
     ssh.ts
     training.ts
   db/
@@ -415,23 +348,57 @@ workflow-lab/
     migrations/             # if needed
   artifacts/                # fake output files written here (gitignored)
   docker-compose.yml        # postgres + redis
+  ecosystem.config.cjs      # pm2 supervisor template (§13)
   package.json
   SPEC.md
   README.md
 ```
 
-Two processes at runtime:
-1. `next dev` (or `next start`) — serves API + UI
-2. `node worker/index.ts` — runs scheduler loop + BullMQ workers
+Three runtime process kinds (see `ecosystem.config.cjs` for the pm2 template):
+1. `next dev` (or `next start`) — serves API + UI.
+2. `pnpm scheduler` — 1× replica. Holds the Postgres advisory lock (§3.9) and runs the scheduler tick loop.
+3. `pnpm worker:cpu` — N× replicas (default `GLOBAL_CPU_SLOTS`). Each runs the CPU BullMQ worker with in-process concurrency 1 so one process saturates one core; CPU work runs in a `worker_threads.Worker` so synchronous compute can never block the heartbeat or BullMQ lock-renewal callbacks. See §13.
+4. `pnpm worker:io` — 1–2× replicas (default `IO_WORKER_REPLICAS`). Runs the SSH and training BullMQ workers with high in-process concurrency (these are I/O-bound).
+
+Worker code is isolated under `scheduler/` and `worker/` — no Next.js or React imports. Both may import from `lib/`.
+
+#### 6.1 Run modes
+
+Two supported ways to launch the scheduler + workers. Both share the same `.env`, Postgres, and Redis; mode B is mode A with the `worker:*` process count fanned out.
+
+| Mode | Command | Layout | When to use |
+|---|---|---|---|
+| **A. Manual (dev)** | `pnpm scheduler`, `pnpm worker:cpu`, `pnpm worker:io` (one terminal each) + `pnpm dev` | 1× scheduler + 1× `worker:cpu` + 1× `worker:io` | Day-to-day development; §9.1, §9.3, §9.4. A crashed worker must be restarted manually — `pnpm worker:cpu:watch` / `pnpm worker:io:watch` provide a poor-man's auto-restart loop. |
+| **B. Supervised (pm2)** | `pnpm supervisor:start` (foreground) or `pnpm supervisor:start:bg` | 1× scheduler + N× `worker:cpu` (N = `GLOBAL_CPU_SLOTS`) + M× `worker:io` (M = `IO_WORKER_REPLICAS`), pm2 auto-restarts crashed processes | §9.2 (`process.exit(1)` chaos — pm2 brings the cpu replica back so the reaper can reclaim its lease), §9.5 (multi-user fairness across replicas), §9.6 (backpressure under real fan-out). |
+
+`ecosystem.config.cjs` is the pm2 template. It reads `GLOBAL_CPU_SLOTS` and `IO_WORKER_REPLICAS` from `.env` to size the replica counts and forces `CPU_WORKER_CONCURRENCY=1` per cpu replica via env override (one process per slot is the §13 invariant).
+
+Mode A is correct for verifying the algorithm; Mode B is correct for verifying the deployment shape. Scenarios that require process-level death-recovery or multi-replica scheduling (§9.2, §9.5, §9.6) only behave correctly under Mode B.
 
 ---
 
-## 7. Configurable parameters (env)
+### 7. Configurable parameters (env)
+
+The values below are the project's committed defaults (see `.env.example`). `4×4` is intentionally small so a developer laptop can run the full multi-process layout described in §13 without exhausting cores. Scale `GLOBAL_CPU_SLOTS`, `GLOBAL_SSH_SLOTS`, and `IO_WORKER_REPLICAS` together when targeting a larger machine.
 
 ```
-GLOBAL_CPU_SLOTS=20
-GLOBAL_SSH_SLOTS=40
+# Global slot pools — caps on simultaneous active leases per kind.
+GLOBAL_CPU_SLOTS=4
+GLOBAL_SSH_SLOTS=4
 GLOBAL_TRAINING_SLOTS=4
+
+# Process-supervisor knobs (consumed by ecosystem.config.cjs, §13).
+# cpu replicas come from GLOBAL_CPU_SLOTS so deployed processes match slot caps.
+IO_WORKER_REPLICAS=4
+
+# Per-kind in-process BullMQ concurrency.
+# In a single-replica deployment these must equal GLOBAL_*_SLOTS (otherwise the
+# scheduler dispatches messages whose DB leases expire while waiting in Redis
+# for a free BullMQ slot). Under the supervisor split, CPU_WORKER_CONCURRENCY
+# is forced to 1 inside each cpu replica via env override.
+CPU_WORKER_CONCURRENCY=4
+SSH_WORKER_CONCURRENCY=1
+TRAINING_WORKER_CONCURRENCY=4
 
 CPU_SLEEP_MIN_MS=3000
 CPU_SLEEP_MAX_MS=5000
@@ -441,14 +408,14 @@ TRAINING_SLEEP_MS=5000
 PIPELINES_PER_JOB=200            # snapshotted onto jobs.pipelines_count at creation; range 1..1000
 SCHEDULER_TICK_MS=1000
 
-# Lease / heartbeat
+# Lease / heartbeat (§3.6, §3.10)
 # TTL must be a comfortable multiple of the heartbeat interval (here 6×). A live worker
-# bumps expires_at every LEASE_HEARTBEAT_MS, so task duration can exceed TTL safely as
-# long as heartbeats keep firing. Reaper only kicks in when heartbeats stop.
+# bumps lease_expires_at every LEASE_HEARTBEAT_MS, so task duration can exceed TTL
+# safely as long as heartbeats keep firing. Reaper only kicks in when heartbeats stop.
 LEASE_TTL_MS=30000
 LEASE_HEARTBEAT_MS=5000
 
-# Per-kind timeouts (used by Promise.race in worker)
+# Per-kind timeouts (used by withTimeout in the worker)
 CPU_TIMEOUT_MS=15000
 SSH_TIMEOUT_MS=5000
 TRAINING_TIMEOUT_MS=60000
@@ -460,12 +427,13 @@ BULLMQ_LOCK_DURATION_MS=70000
 MAX_ATTEMPTS=3
 
 # Backpressure (CPU paused when SSH backlog exceeds this)
-SSH_BACKPRESSURE_THRESHOLD=80
+# Rule of thumb: 2 × GLOBAL_SSH_SLOTS. With GLOBAL_SSH_SLOTS=4 → 8.
+SSH_BACKPRESSURE_THRESHOLD=8
 
 # Chaos knobs (default 0 = off; set to inject failures)
-CHAOS_CPU_CRASH_RATE=0.10        # 10% of CPU tasks: process.exit mid-run
-CHAOS_SSH_TIMEOUT_RATE=0.05      # 5% of SSH tasks: sleep past SSH_TIMEOUT_MS
-CHAOS_SSH_MISSING_ARTIFACT_RATE=0.05  # 5% of SSH tasks: succeed without writing file
+CHAOS_CPU_CRASH_RATE=0.02        # CPU thread: process.exit mid-run
+CHAOS_SSH_TIMEOUT_RATE=0.02      # SSH task: sleep past SSH_TIMEOUT_MS
+CHAOS_SSH_MISSING_ARTIFACT_RATE=0.05  # SSH task: succeed without writing file
 
 DATABASE_URL=postgres://...
 REDIS_URL=redis://localhost:6379
@@ -474,7 +442,9 @@ ARTIFACTS_DIR=./artifacts
 
 ---
 
-## 8. Code style
+## Conventions and validation
+
+### 8. Code style
 
 - **TypeScript strict mode** everywhere.
 - Next.js **App Router** (not Pages Router).
@@ -488,72 +458,71 @@ ARTIFACTS_DIR=./artifacts
 
 ---
 
-## 9. Testing strategy
+### 9. Testing strategy
 
 **No automated tests for this lab** (per user). Manual verification consists of one happy-path scenario plus five chaos scenarios. Each chaos scenario maps to one chaos env var; flip it on, run, observe.
 
-### 9.0 Setup
-1. `docker-compose up -d` (postgres + redis)
-2. `psql -f db/schema.sql`
-3. `pnpm worker` (terminal 1)
-4. `pnpm dev` (terminal 2)
+#### 9.0 Setup
+1. `docker-compose up -d` (postgres + redis).
+2. `pnpm db:reset` (or `psql -f db/schema.sql`).
+3. Pick a run mode from §6.1 — Mode A (manual) for §9.1/§9.3/§9.4, Mode B (pm2 supervisor) for §9.2/§9.5/§9.6.
+4. `pnpm dev` (separate terminal) — Next.js app + dashboard.
 5. Open dashboard, create users alice/bob/carol.
 
-### 9.1 Happy path (all chaos knobs = 0)
+#### 9.1 Happy path (all chaos knobs = 0)
 - Submit a job as alice. All 200 pipelines complete; one training artifact written; `jobs.status = completed`.
 
-### 9.2 Scenario 1 — Worker crash (CPU)
+#### 9.2 Scenario 1 — Worker crash (CPU)
 - Set `CHAOS_CPU_CRASH_RATE=0.10`.
 - Submit job. ~10% of CPU tasks will `process.exit(1)` mid-sleep (kills the whole worker → restart it manually, or use `nodemon`).
 - **Expect**: leases of crashed tasks expire after `LEASE_TTL_MS`; reaper sets them back to `pending`; they're re-dispatched on a later tick. `attempts` increments. Job still completes.
 
-### 9.3 Scenario 2 — SSH timeout
+#### 9.3 Scenario 2 — SSH timeout
 - Set `CHAOS_SSH_TIMEOUT_RATE=0.05`.
 - ~5% of SSH tasks sleep past `SSH_TIMEOUT_MS`.
 - **Expect**: `Promise.race` rejects with timeout; task marked `pending` (retryable) or `failed` (after `MAX_ATTEMPTS`). Worker is **not** stuck. Lease released cleanly. Job completes only if every SSH eventually succeeds.
 
-### 9.4 Scenario 3 — Artifact missing
+#### 9.4 Scenario 3 — Artifact missing
 - Set `CHAOS_SSH_MISSING_ARTIFACT_RATE=0.05`.
 - 5% of SSH tasks return without writing the result file.
 - **Expect**: `verifyArtifact()` throws → task → retry. Even if a buggy worker bypassed verification, the **barrier check counts only SSH tasks with on-disk artifacts**, so training never starts prematurely.
 
-### 9.5 Scenario 4 — Multi-user fairness
+#### 9.5 Scenario 4 — Multi-user fairness
 - Submit jobs from alice, bob, carol within ~2 seconds of each other.
-- **Expect**: dashboard's fairness panel shows running CPU counts converging — no user is starved. Approximate steady state: each user gets ~`GLOBAL_CPU_SLOTS / active_users` slots (~6/6/7 split for 3 users at 20 slots).
+- **Expect**: dashboard's fairness panel shows running CPU counts converging — no user is starved. Approximate steady state: each user gets `floor(GLOBAL_CPU_SLOTS / active_users)` or `ceil(GLOBAL_CPU_SLOTS / active_users)` slots, i.e. counts within 1 of each other. With the default `GLOBAL_CPU_SLOTS=4` and 3 users this is a 2/1/1 split (which user holds the extra slot rotates as tasks finish). Scaled up to `GLOBAL_CPU_SLOTS=20` it would be ~7/7/6.
 
-### 9.6 Scenario 5 — Backpressure
+#### 9.6 Scenario 5 — Backpressure
 - Lower `GLOBAL_SSH_SLOTS=5` and `SSH_BACKPRESSURE_THRESHOLD=15`.
 - Submit a job. CPU tasks produce SSH tasks faster than 5 SSH slots can drain.
 - **Expect**: once SSH backlog (pending+queued+running) hits 15, scheduler stops dispatching new CPU tasks; SSH catches up; CPU resumes. No unbounded growth of SSH `pending` count.
 
 ---
 
-## 10. Boundaries
+### 10. Boundaries
 
-### Always do
+#### Always do
 - Treat the **DB as source of truth**. Tasks must never exist only in BullMQ.
-- Acquire a **lease row** before enqueuing; release it when the task finishes. Leases are how slot-counting works.
-- Use a DB transaction for: lease creation, status transitions, barrier check / training-task creation.
+- Acquire a **lease** (set `tasks.lease_token` + expiry) before enqueuing; clear it when the task finishes. Leases are how slot-counting works.
+- Use a DB transaction for: lease acquisition, status transitions, barrier check / training-task creation.
 - Make all sleep durations, slot counts, timeouts, and chaos rates read from env / config.
-- **Heartbeat the lease** while a task runs. A worker that cannot heartbeat is treated as dead.
+- **Heartbeat the lease** (bump `lease_heartbeat_at` + `lease_expires_at`) while a task runs. A worker that cannot heartbeat is treated as dead.
 - **Verify the artifact file on disk before inserting the artifact row.** The barrier counts artifact rows — never status alone.
-- Wrap every worker handler in `Promise.race(work, timeout)`. No worker may block forever.
+- Wrap every worker handler in `withTimeout(work, *_TIMEOUT_MS)`. No worker may block forever.
 - Reaper logic lives **inside the scheduler tick**, not a separate process.
-- **Atomic-claim** in workers: every worker handler's first DB write must be a conditional `UPDATE` keyed on `(taskId, status, attempts, leaseId)`. Stale messages must be silently ignored.
+- **Atomic-claim** in workers: every worker handler's first DB write must be a conditional `UPDATE` keyed on `(taskId, status='queued', lease_token, attempts)`. Stale messages must be silently ignored.
 - **Optimistic-lock** in workers: every subsequent state change must include `WHERE attempts=$myAttempts`. If 0 rows updated, abort and don't write side effects.
 - **Snapshot `pipelines_count` onto `jobs`** at creation time. The barrier compares against the row, not the live env var.
 - **Single scheduler instance**: enforce via `pg_try_advisory_lock` on worker startup. Refuse to start if another holds it.
 - **Mark the job `failed`** as soon as any leaf task hits permanent `failed` (attempts exhausted). Do not let jobs hang on barriers that can never fire.
 
-### Ask first
+#### Ask first
 - Adding a new dependency beyond: `next`, `react`, `react-dom`, `pg`, `bullmq`, `ioredis`, `zod`, `tailwindcss`, `typescript`, `tsx`.
 - Adding priority tiers, per-user quotas, or deadline-aware scheduling.
-- Splitting the worker into multiple processes (planned — see §13).
 - Switching from single `package.json` to a pnpm workspace.
 - Changing barrier semantics (e.g. allowing partial-success training).
 - Cancelling already-running tasks on job failure. Default is "let them finish, ignore the result".
 
-### Never do
+#### Never do
 - **Never enqueue all CPU tasks at job-creation time** (regardless of `PIPELINES_PER_JOB` value). That defeats the entire learning goal.
 - Never use BullMQ priorities or BullMQ retries to substitute for the DB-driven retry/lease mechanism. Failures must flow through `tasks.status` + `attempts`.
 - Never hold a DB transaction open across a BullMQ enqueue, a `sleep`, a `fs.access`, or any non-DB IO.
@@ -568,7 +537,9 @@ ARTIFACTS_DIR=./artifacts
 
 ---
 
-## 11. Decisions log
+## Reference
+
+### 11. Decisions log
 
 - DB access: **raw `pg`**, no ORM.
 - Package manager: **pnpm**.
@@ -582,7 +553,7 @@ ARTIFACTS_DIR=./artifacts
 
 ---
 
-## 12. Out of scope (acknowledged limitations)
+### 12. Out of scope (acknowledged limitations)
 
 These edge cases exist but are deliberately not addressed:
 
@@ -596,11 +567,13 @@ These edge cases exist but are deliberately not addressed:
 
 ---
 
-## 13. Planned change — multi-process scaling for CPU-bound work
+## Addendum: multi-process scaling
 
-**Status**: planned, not implemented. Current system keeps scheduler + all three BullMQ workers in one Node process (`worker/index.ts`). This section records the intended target shape so we don't lose context. Short term we keep the existing single-process layout.
+### 13. Multi-process scaling for CPU-bound work
 
-### 13.1 Motivation
+**Status**: implemented (2026-05-10). The scheduler/worker split, `WORKER_ROLE` selector, `worker_threads`-based CPU work, and pm2 supervisor template (`ecosystem.config.cjs`) all shipped. This section is retained as the architectural rationale — read it to understand *why* the layout looks the way it does.
+
+#### 13.1 Motivation
 
 CPU tasks are currently simulated with `sleep` (I/O-bound), so a single Node event loop can multiplex them via `concurrency`. The lab is expected to evolve toward **real CPU-bound** CPU tasks (synchronous compute — matrix ops, hashing, etc.). At that point:
 
@@ -612,79 +585,68 @@ CPU tasks are currently simulated with `sleep` (I/O-bound), so a single Node eve
 
 Scaling fan-out across the available cores (target: ~20) is therefore both a **throughput** problem and a **correctness** problem.
 
-### 13.2 Target architecture
+#### 13.2 Architecture
 
-Two changes, complementary:
+Two complementary pieces — a process split, and an in-process thread split.
 
-#### (a) Split `scheduler` and `worker` into separate process entries
+**Process split: `scheduler` and `worker` are separate entries.**
 
-`worker/index.ts` currently bundles three things: advisory-lock acquisition, scheduler tick loop, three BullMQ workers. Once we want N worker replicas, the advisory lock forces N−1 of them to exit (§3.9). So we split:
+A single bundled entry would force N−1 of N worker replicas to exit on the advisory lock (§3.9). So the entries are split:
 
 ```
 scheduler/index.ts   →  acquireSchedulerLock + runSchedulerLoop  (replicas = 1)
 worker/index.ts      →  BullMQ workers only, role-selectable     (replicas = N)
 ```
 
-`worker/index.ts` reads `WORKER_ROLE` from env and starts the appropriate workers:
+`worker/index.ts` reads `WORKER_ROLE` from env and starts the appropriate workers (see `worker/role.ts`):
 
 | `WORKER_ROLE` | Workers started | `concurrency` | Replicas | Rationale |
 |---|---|---|---|---|
-| `cpu` | `cpu` only | **1** | ~`GLOBAL_CPU_SLOTS` (≈18–20) | one CPU-bound process per core |
-| `io` | `ssh` + `training` | high (`SSH_WORKER_CONCURRENCY` / `TRAINING_WORKER_CONCURRENCY`) | 1–2 | I/O-bound; event loop multiplexes |
+| `cpu` | `cpu` only | **1** (forced via env override in `ecosystem.config.cjs`) | `GLOBAL_CPU_SLOTS` | one CPU-bound process per slot |
+| `io` | `ssh` + `training` | `SSH_WORKER_CONCURRENCY` / `TRAINING_WORKER_CONCURRENCY` | `IO_WORKER_REPLICAS` | I/O-bound; event loop multiplexes |
 
-`package.json` gains:
+`package.json` scripts:
 ```json
 "scheduler":  "tsx --env-file=.env scheduler/index.ts",
 "worker:cpu": "WORKER_ROLE=cpu tsx --env-file=.env worker/index.ts",
 "worker:io":  "WORKER_ROLE=io  tsx --env-file=.env worker/index.ts"
 ```
 
-`acquireSchedulerLock` is removed from the worker entry — only the scheduler process holds the lock. Worker processes do not need it (BullMQ + Redis already make `cpu`/`ssh`/`training` queue consumption atomic).
+The advisory lock is held only by the scheduler process. Worker processes do not acquire it — BullMQ + Redis already serialise `cpu` / `ssh` / `training` queue consumption.
 
-#### (b) Run actual CPU work in `worker_threads` inside each CPU worker process
+See §6.1 for the two supported run modes (manual `tsx` per role vs. pm2 supervisor).
 
-This is independent of (a) and is **required as soon as `defaultCpuWork` becomes synchronous compute** — even with one process per core, blocking the main thread breaks the heartbeat and BullMQ lock renewal as described in §13.1.
+**Thread split: CPU work runs inside a `worker_threads.Worker`.**
 
-Shape:
+Even with one process per slot, synchronous compute on the main thread would block the heartbeat `setInterval` and BullMQ lock-renewal callbacks. So `worker/cpu.ts` spawns `worker/cpu-thread.ts` in a `worker_threads.Worker`:
 
 ```
-worker/cpu.ts          →  defaultCpuWork spawns worker_threads.Worker(cpu-thread.js),
+worker/cpu.ts          →  defaultCpuWork spawns worker_threads.Worker(cpu-thread),
                           awaits its message / exit.
-                          On withTimeout rejection, terminate() the thread.
-worker/cpu-thread.ts   →  runs the synchronous compute, writes the artifact,
+                          On withTimeout rejection, AbortController triggers terminate().
+worker/cpu-thread.ts   →  runs the (currently simulated) compute, writes the artifact,
                           parentPort.postMessage(artifactPath).
 ```
 
-Effect: the BullMQ worker's main thread stays free to:
+The BullMQ worker's main thread stays free to:
 - run the `startHeartbeat` `setInterval` against the lease,
 - service the BullMQ lock-renewal callback,
 - honour `withTimeout` on `CPU_TIMEOUT_MS`.
 
-`runCpuTask`'s atomic claim, optimistic lock, artifact verification, and finalize remain unchanged — only `doWork` moves to a thread.
+`runCpuTask`'s atomic claim, optimistic lock, artifact verification, and finalize all stay on the main thread; only `doWork` moves into the thread.
 
-### 13.3 Slot-cap re-tuning
+#### 13.3 Slot-cap tuning
 
-When the architecture lands, re-evaluate config:
+The committed defaults (§7) target a developer laptop. When deploying to a larger machine, scale these together:
 
-- `GLOBAL_CPU_SLOTS` should match the deployed count of `worker:cpu` processes (e.g. 18 if we leave 2 cores headroom for scheduler + IO worker + OS).
-- `SSH_BACKPRESSURE_THRESHOLD` may need to scale with the larger CPU throughput, otherwise SSH backlog hits the gate too easily and CPU dispatch stalls.
-- `BULLMQ_LOCK_DURATION_MS` and `LEASE_TTL_MS` interact with worker_threads: even with the thread split, set them generously (TTL ≥ heartbeat × 6 stays the right rule).
+- `GLOBAL_CPU_SLOTS` — must equal the deployed count of `worker:cpu` processes; the supervisor reads this same env var to spawn replicas.
+- `IO_WORKER_REPLICAS` — typically 1–2 unless SSH/training timeouts dominate.
+- `SSH_BACKPRESSURE_THRESHOLD` — scales with CPU throughput; the rule of thumb `2 × GLOBAL_SSH_SLOTS` still applies.
+- `BULLMQ_LOCK_DURATION_MS` and `LEASE_TTL_MS` — `TTL ≥ heartbeat × ~6` stays the right rule (§3.10); only revisit if heartbeat cadence changes.
 
-### 13.4 What does NOT change
+#### 13.4 What did NOT change
 
 - DB schema, fairness algorithm (§3.3), barrier (§3.5), reaper (§3.6), failure semantics (§3.7), backpressure logic (§3.8) — all single-instance scheduler invariants are preserved by the advisory lock living in the dedicated `scheduler/` process.
 - Public API (§4) and dashboard (§5).
 - BullMQ queue names and message shapes.
 - Single `package.json` layout (§3 / §6) — no workspace split.
-
-### 13.5 Sequencing (for future implementation)
-
-In rough dependency order, not committed to phases yet:
-
-1. **Move CPU-bound work to `worker_threads`** (no process split yet). This is also the prerequisite for `defaultCpuWork` ever being real compute. Owns its own correctness story (heartbeat + BullMQ lock renewal stay alive).
-2. **Extract `scheduler/index.ts`** from `worker/index.ts`; add `WORKER_ROLE` switch in `worker/index.ts`; add `package.json` scripts.
-3. **Process supervisor wiring** (pm2 / Docker Compose / systemd template) to run 1× scheduler, ~18× `worker:cpu`, 1–2× `worker:io`.
-4. **Re-tune `GLOBAL_CPU_SLOTS` and `SSH_BACKPRESSURE_THRESHOLD`** against the new fan-out.
-5. **Manual verification** that fairness (§9.5) and backpressure (§9.6) still hold under the multi-process layout.
-
-Until these land, the existing single-process worker is the supported configuration.

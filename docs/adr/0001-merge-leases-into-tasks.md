@@ -11,10 +11,10 @@ table. Each scheduler dispatch INSERTs a new row; reaper / finalize sets
 
 1. **Slot accounting ledger** — `count(leases WHERE released_at IS NULL)` is
    how the scheduler knows how many CPU/SSH/training slots are in use
-   (`lib/scheduler.ts:99-107`).
+   (`lib/scheduler.ts`).
 2. **Fencing token** — the BullMQ message carries `leaseId`; `claimTask`
    gates on `EXISTS (SELECT 1 FROM leases WHERE id=$3 AND task_id=$1 AND
-released_at IS NULL)` (`lib/worker.ts:115-118`) to reject stale
+released_at IS NULL)` (`lib/worker.ts`) to reject stale
    deliveries.
 3. **History** — every dispatch attempt leaves a row with
    `acquired_at / heartbeat_at / released_at`, allowing post-hoc audit.

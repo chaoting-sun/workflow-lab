@@ -6,17 +6,17 @@ This doc captures how `tasks.status` transitions are produced, which writers tou
 
 | From → To           | Writer                                          | Touches `attempts`? |
 | ------------------- | ----------------------------------------------- | ------------------- |
-| pending → queued    | `reserveOneTask` (`lib/scheduler.ts:29`)        | No                  |
-| queued  → running   | `claimTask` (`lib/worker.ts:95`)                | **Yes (+1)**        |
-| running → succeeded | `finalize*Success` (`lib/worker.ts:150`, `:179`, `:269`) | No         |
-| running → pending   | `finalizeTaskFailure` retryable arm (`lib/worker.ts:203`) | No        |
-| running → failed    | `finalizeTaskFailure` terminal arm (`lib/worker.ts:203`)  | No        |
-| running → pending   | `reapExpiredLeases` (`lib/scheduler.ts:146`)    | **No (by design)**  |
+| pending → queued    | `reserveOneTask` (`lib/scheduler.ts`)           | No                  |
+| queued  → running   | `claimTask` (`lib/worker.ts`)                   | **Yes (+1)**        |
+| running → succeeded | `finalize*Success` (`lib/worker.ts`)            | No                  |
+| running → pending   | `finalizeTaskFailure` retryable arm (`lib/worker.ts`) | No            |
+| running → failed    | `finalizeTaskFailure` terminal arm (`lib/worker.ts`)  | No            |
+| running → pending   | `reapExpiredLeases` (`lib/scheduler.ts`)        | **No (by design)**  |
 | running → queued    | **No direct writer. Two-step path only.**       | —                   |
 
 ## Invariant: `attempts` is incremented only by the claim
 
-Reaper deliberately does NOT bump `attempts` (`lib/scheduler.ts:139-142`). The rationale, kept in code comments at that site:
+Reaper deliberately does NOT bump `attempts` (`lib/scheduler.ts`). The rationale, kept in code comments at that site:
 
 > A worker that briefly stalls past lease TTL but still finalizes successfully would otherwise be charged an extra attempt against `max_attempts`. The next `claimTask` is the single point where attempts increase.
 
@@ -35,33 +35,41 @@ running  ──reap───────►  pending  ──dispatch──►  q
           attempts unchanged)
 ```
 
-- **Step 1 (reap).** `reapExpiredLeases` (`lib/scheduler.ts:146`) selects tasks where `lease_expires_at < now() AND status IN ('queued','running')`, sets the task to `pending`, and clears the lease columns (`lease_token`, `lease_expires_at`, `lease_heartbeat_at`). Heartbeats normally keep `lease_expires_at` ahead of `now()`, but a stalled heartbeat (DB blip, event-loop pause, chained tick blocked on a slow `UPDATE`) will let it slip.
+- **Step 1 (reap).** `reapExpiredLeases` (`lib/scheduler.ts`) selects tasks where `lease_expires_at < now() AND status IN ('queued','running')`, sets the task to `pending`, and clears the lease columns (`lease_token`, `lease_expires_at`, `lease_heartbeat_at`). Heartbeats normally keep `lease_expires_at` ahead of `now()`, but a stalled heartbeat (DB blip, event-loop pause, chained tick blocked on a slow `UPDATE`) will let it slip.
 - **Step 2 (dispatch).** The same scheduler tick (or a subsequent one) runs `dispatchKind` → `reserveOneTask`, which selects on `status='pending'` and writes `status='queued'` plus a fresh `lease_token` / `lease_expires_at` / `lease_heartbeat_at` in the same UPDATE.
 
 Both writes preserve `attempts`, so the row's `attempts` value is the same as before the cycle.
 
 ## When the two-step path can fire
 
-The dispatch step (`reserveOneTask`) requires a live worker process running the scheduler tick — there is no other entry point in the codebase that calls it. Two scenarios produce the observed transition:
+The dispatch step (`reserveOneTask`) requires the scheduler process running its tick loop — there is no other entry point in the codebase that calls it. Two scenarios produce the observed transition:
 
-1. **Final tick during graceful shutdown.** `worker/index.ts:90-107` runs `await loop.stop()` first. `loop.stop()` clears the next-tick timer but **awaits the in-flight tick** so it can finish its `reapExpiredLeases` + parallel `dispatchKind` work. If a heartbeat had stalled long enough for a lease to expire, this final tick reaps the task to `pending` and dispatches it back to `queued` before shutdown progresses.
-2. **Restart inside the lease TTL window.** If the worker is killed (graceful or hard), heartbeats stop, and a fresh worker boots before any external observer queries, the new worker's first tick reaps the orphaned lease (`status='running'` from the previous process), flips it to `pending`, then dispatches to `queued` — same two-step path, just spanning a process boundary.
+1. **Final tick during graceful shutdown of the scheduler.** The scheduler shutdown handler (`scheduler/index.ts`) runs `await loop.stop()` first. `loop.stop()` clears the next-tick timer but **awaits the in-flight tick** so it can finish its `reapExpiredLeases` + parallel `dispatchKind` work. If a heartbeat had stalled long enough for a lease to expire, this final tick reaps the task to `pending` and dispatches it back to `queued` before shutdown progresses.
+2. **Restart inside the lease TTL window.** If the scheduler (or a worker) is killed (graceful or hard), heartbeats stop, and a fresh scheduler tick fires before any external observer queries, that tick reaps the orphaned lease (`status='running'` from the previous owner), flips it to `pending`, then dispatches to `queued` — same two-step path, just spanning a process boundary.
 
 The two scenarios are indistinguishable from the current `tasks` row alone — and after ADR-0001 the row no longer keeps the per-attempt lease history that used to disambiguate them. See Diagnostics below for what can still be inferred and where logs become the source of truth.
 
 ## Graceful shutdown contract
 
-Ctrl+C / SIGTERM handler (`worker/index.ts:90-107`) runs in this order:
+Scheduler and workers run as separate processes; each has its own SIGTERM / SIGINT handler.
+
+**Scheduler process** (`scheduler/index.ts`) shuts down in this order:
 
 1. `loop.stop()` — sets stopped flag, clears next-tick timer, **awaits the in-flight tick**. A reap+dispatch cycle already in motion will complete.
-2. `cpuWorker.close()` / `sshWorker.close()` / `trainingWorker.close()` — BullMQ default (`force=false`), each one **waits for its in-flight job to finalize** (no timeout). This is why `running` rows drain to `succeeded`/`pending`/`failed` over seconds rather than dropping instantly.
-3. `closeQueues()`, `lock.release()`, `closeDb()`, `process.exit(0)`.
+2. `closeQueues()` — closes BullMQ queue producers used by `dispatchKind`.
+3. `lock.release()` — releases the Postgres advisory lock so a replacement scheduler can boot.
+4. `closeDb()`, `process.exit(0)`.
 
-There is no active "running → queued" requeue logic in the shutdown path. Recovery of orphaned leases is passive, via `reapExpiredLeases` on the next tick (this process's final tick, or the next worker's first tick).
+**Worker process** (`worker/index.ts`) shuts down in this order:
+
+1. For each kind in the role (cpu / ssh / training): `worker.close()` — BullMQ default (`force=false`), each one **waits for its in-flight job to finalize** (no timeout). This is why `running` rows drain to `succeeded`/`pending`/`failed` over seconds rather than dropping instantly.
+2. `closeQueues()`, `closeDb()`, `process.exit(0)`.
+
+There is no active "running → queued" requeue logic in either shutdown path. Recovery of orphaned leases is passive, via `reapExpiredLeases` on the next scheduler tick (the scheduler's final tick before exit, or the next scheduler instance's first tick after restart).
 
 What the shutdown path does **not** currently do:
 
-- No timeout / force-exit fallback on a wedged in-flight job. If a task hangs past `worker.close()`'s implicit wait, the process stays up until BullMQ's `lockDuration` lets the job stall.
+- No timeout / force-exit fallback on a wedged in-flight job. If a task hangs past `worker.close()`'s implicit wait, the worker process stays up until BullMQ's `lockDuration` lets the job stall.
 - No cancellation token threaded into `runCpuTask` / `runSshTask` / `runTrainingTask`. The handlers run to completion regardless of the shutdown signal.
 - No `uncaughtException` / `unhandledRejection` handler.
 
