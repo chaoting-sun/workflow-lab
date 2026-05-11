@@ -1,9 +1,9 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { apiFetch } from "./api-client";
 
-type FetchMock = ReturnType<typeof vi.fn>;
-
-function mockFetch(impl: (input: string, init?: RequestInit) => Response | Promise<Response>): FetchMock {
+function mockFetch(
+  impl: (input: string, init?: RequestInit) => Response | Promise<Response>,
+) {
   const fn = vi.fn(impl);
   globalThis.fetch = fn as unknown as typeof fetch;
   return fn;
@@ -13,7 +13,6 @@ const originalFetch = globalThis.fetch;
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
-  vi.restoreAllMocks();
 });
 
 describe("apiFetch", () => {
