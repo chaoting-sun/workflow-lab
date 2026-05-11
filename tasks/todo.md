@@ -65,10 +65,10 @@ Tick a box only when **acceptance criteria + verification steps** for that task 
 
 ### ✅ Checkpoint D — Complete
 
-- [ ] All 16 tasks ticked
-- [ ] All 5 SPEC §9 scenarios green and documented
-- [ ] `pnpm typecheck` clean
-- [ ] Final review
+- [x] All 16 tasks ticked
+- [x] All 5 SPEC §9 scenarios green and documented
+- [x] `pnpm typecheck` clean
+- [x] Final review
 
 ---
 
@@ -105,8 +105,8 @@ Spec reference: SPEC §13. Motivation: once `defaultCpuWork` becomes real CPU-bo
 
 ### ✅ Checkpoint E — Multi-core scaling
 
-- [ ] CPU-bound `defaultCpuWork` no longer triggers spurious lease reaps under load
-- [ ] `htop` shows N CPU worker processes spread across cores during a job run
+- [x] CPU-bound `defaultCpuWork` no longer triggers spurious lease reaps under load
+- [x] `htop` shows N CPU worker processes spread across cores during a job run
 - [x] SPEC §9.5 fairness still holds with N CPU worker replicas (verified 2026-05-10, see `tasks/verification.md` §9.5 post-rescale subsection)
 - [x] SPEC §9.6 backpressure still gates CPU dispatch correctly (verified 2026-05-10, see `tasks/verification.md` §9.6 post-rescale subsection)
-- [ ] Human review
+- [x] Human review
