@@ -101,7 +101,7 @@ future commits) and yields clearer claim-rejection logs.
     for the scheduler advisory-lock contention.
   - Fairness query no longer JOINs `leases`; uses existing
     `tasks_kind_status_user_idx` for the count subqueries.
-  - `docs/task-lifecycle.md`'s "running → queued puzzle" simplifies
+  - `docs/03-design/task-lifecycle.md`'s "running → queued puzzle" simplifies
     because the lease no longer has its own released_at axis to reason
     about; the puzzle becomes a one-table state machine.
 

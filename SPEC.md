@@ -1,5 +1,7 @@
 # Workflow Lab — Specification
 
+> **Note on this document.** SPEC.md is the canonical, single-file specification used by agentic workflows (spec-driven development, planning agents). It is intentionally long because it is read by agents that benefit from co-located context. **For human reading, start at [`README.md`](./README.md) and [`docs/`](./docs/) — those are organised by audience and visualised with diagrams.** When the design changes, treat this file as the source of truth and update the human-facing `docs/` views afterwards.
+
 ## Goal and scope
 
 ### 1. Objective

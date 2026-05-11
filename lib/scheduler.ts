@@ -25,7 +25,7 @@ type DispatchKind = "cpu" | "ssh" | "training";
 //
 // Sole writer of `status='queued'` from `pending`. Composed with the reaper's
 // `running → pending` step, both writes leave `attempts` untouched —
-// see docs/task-lifecycle.md "running → queued puzzle".
+// see docs/03-design/task-lifecycle.md "running → queued puzzle".
 async function reserveOneTask(
   kind: DispatchKind,
   leaseTtlMs: number,
@@ -139,7 +139,7 @@ async function dispatchKind(
 // finalize counted as one extra attempt against max_attempts.
 // Consequence: a `running → pending → queued` cycle (reap then re-dispatch)
 // preserves `attempts`, which is the diagnostic fingerprint described in
-// docs/task-lifecycle.md "running → queued puzzle".
+// docs/03-design/task-lifecycle.md "running → queued puzzle".
 //
 // Permanent failure (attempts >= max_attempts) propagates to jobs.status so
 // downstream consumers stop waiting on a barrier that can never fire.

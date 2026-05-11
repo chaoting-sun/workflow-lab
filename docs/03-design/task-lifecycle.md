@@ -95,5 +95,5 @@ If you need authoritative attribution of a specific reap-vs-finalize event, trea
 
 ## Related docs
 
-- `docs/timeout-and-death-detection.md` — how heartbeat, reaper, and `withTimeout` compose to detect a dead vs. wedged worker.
-- `docs/queue-architecture-tradeoffs.md` — why dispatch state lives in Postgres rather than being driven by BullMQ.
+- [`timeout-and-death.md`](./timeout-and-death.md) — how heartbeat, reaper, and `withTimeout` compose to detect a dead vs. wedged worker.
+- [`scheduler-vs-queue.md`](./scheduler-vs-queue.md) — why dispatch state lives in Postgres rather than being driven by BullMQ.
