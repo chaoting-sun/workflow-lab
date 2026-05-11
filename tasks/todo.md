@@ -133,7 +133,7 @@ Audit performed 2026-05-11. Source files without a `.test.ts` sibling and missin
 
 ### E2E gaps (none today)
 
-- [ ] **T32** — Decide and document E2E posture in an ADR. Options: (a) lightweight HTTP E2E via `supertest` + a spawned worker/scheduler; (b) browser E2E via Playwright; (c) keep `scripts/run-scenario-*.sh` and add assertions (parse `/api/jobs` JSON, exit non-zero on mismatch). — XS
+- [x] **T32** — Decide and document E2E posture in an ADR. Options: (a) lightweight HTTP E2E via `supertest` + a spawned worker/scheduler; (b) browser E2E via Playwright; (c) keep `scripts/run-scenario-*.sh` and add assertions (parse `/api/jobs` JSON, exit non-zero on mismatch). — XS — decision: option (c), see `docs/adr/0002-e2e-posture.md`
 - [ ] **T33** — Implement one happy-path E2E per the T32 decision: submit job → observe completion via the chosen surface. — M (size depends on T32)
 
 ### Frontend (untested entirely)
